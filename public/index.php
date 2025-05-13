@@ -42,10 +42,54 @@ function handleDiRoutes($path)
 
 function handleDeanRoutes($path)
 {
+    error_log("Entering handleDeanRoutes with path: $path");
     AuthMiddleware::handle('dean'); // Require dean role
-    http_response_code(404);
-    echo "Dean routes not implemented";
-    exit;
+
+    require_once __DIR__ . '/../src/controllers/DeanController.php';
+    $controller = new DeanController();
+
+    // Normalize path for comparison
+    $normalizedPath = '/' . trim($path, '/');
+    error_log("Normalized path: $normalizedPath");
+
+    switch ($normalizedPath) {
+        case '/dean/dashboard':
+            $controller->dashboard();
+            break;
+        case '/dean/schedule':
+            $controller->mySchedule();
+            break;
+        case '/dean/classroom':
+            $controller->classroom();
+            break;
+        case '/dean/faculty':
+            $controller->faculty();
+            break;
+        case '/dean/search':
+            $controller->search();
+            break;
+        case '/dean/courses':
+            $controller->courses();
+            break;
+        case '/dean/curriculum':
+            $controller->curriculum();
+            break;
+        case '/dean/profile':
+            $controller->profile();
+            break;
+        case '/dean/settings':
+            $controller->settings();
+            break;
+        case '/dean/logout':
+            error_log("Routing to AuthController::logout");
+            require_once __DIR__ . '/../src/controllers/AuthController.php';
+            (new AuthController())->logout();
+            exit;
+        default:
+            http_response_code(404);
+            echo "Page not found";
+            exit;
+    }
 }
 
 function handleChairRoutes($path)
@@ -66,12 +110,12 @@ function handleChairRoutes($path)
             $controller->dashboard();
             exit;
         case '/chair/my_schedule':
-            error_log("Routing to ChairController::mySchedule");
+            error_log("Routing to ChairController::my_schedule");
             $controller->mySchedule();
             exit;
-        case '/chair/schedule':
+        case '/chair/schedule_management':
             error_log("Routing to ChairController::createSchedule");
-            $controller->createSchedule();
+            $controller->manageSchedule();
             exit;
         case '/chair/classroom':
             error_log("Routing to ChairController::classroom");
@@ -85,10 +129,10 @@ function handleChairRoutes($path)
             error_log("Routing to ChairController::faculty");
             $controller->faculty();
             exit;
-        case '/chair/faculty/search':
-            error_log("Routing to ChairController::search");
-            $controller->search();
-            exit;
+            case '/chair/faculty/search':
+                error_log("Routing to ChairController::searchFaculty");
+                $controller->searchFaculty();
+                exit;
         case '/chair/courses':
             error_log("Routing to ChairController::courses");
             $controller->courses();
@@ -157,6 +201,11 @@ function handleFacultyRoutes($path)
                 $controller->profile();
             }
             exit;
+        case '/faculty/logout':
+            error_log("Routing to AuthController::logout");
+            require_once __DIR__ . '/../src/controllers/AuthController.php';
+            (new AuthController())->logout();
+            exit;
         default:
             error_log("No matching faculty route for: $normalizedPath");
             http_response_code(404);
@@ -169,29 +218,46 @@ function handleFacultyRoutes($path)
 $path = trim(parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH), '/');
 
 // Public routes that don't require authentication
-$publicRoutes = ['login', 'register', '', 'home', 'public/search', 'api/departments', 'logout'];
+$publicRoutes = ['login', 'register', '', 'home', 'public/search', 'api/departments'];
 
 if (in_array($path, $publicRoutes)) {
     require_once __DIR__ . '/../src/controllers/AuthController.php';
-    $authController = new AuthController();
-
-    require_once __DIR__ . '/../src/controllers/PublicController.php';
-    $publicController = new PublicController();
+    $controller = new AuthController();
 
     switch ($path) {
         case 'login':
-            $authController->login();
+            $controller->login();
             break;
         case 'register':
-            $authController->register();
+            $controller->register();
             break;
         case '':
         case 'home':
-            $publicController->showHomepage();
+            require_once __DIR__ . '/../src/controllers/PublicController.php';
+            (new PublicController())->showHomepage();
             break;
         case 'public/search':
             if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-                $publicController->searchSchedules();
+                require_once __DIR__ . '/../src/controllers/PublicController.php';
+                (new PublicController())->searchSchedules();
+            } else {
+                http_response_code(405);
+                echo "Method Not Allowed";
+            }
+            break;
+        case 'public/sections':
+            if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+                require_once __DIR__ . '/../src/controllers/PublicController.php';
+                (new PublicController())->getDepartmentSections();
+            } else {
+                http_response_code(405);
+                echo "Method Not Allowed";
+            }
+            break;
+        case 'public/departments':
+            if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+                require_once __DIR__ . '/../src/controllers/PublicController.php';
+                (new PublicController())->getCollegeDepartments();
             } else {
                 http_response_code(405);
                 echo "Method Not Allowed";
@@ -199,14 +265,11 @@ if (in_array($path, $publicRoutes)) {
             break;
         case 'api/departments':
             if ($_SERVER['REQUEST_METHOD'] === 'GET') {
-                $authController->getDepartments();
+                $controller->getDepartments();
             } else {
                 http_response_code(405);
                 echo "Method Not Allowed";
             }
-            break;
-        case 'logout':
-            $publicController->logout();
             break;
         default:
             http_response_code(404);
@@ -218,7 +281,17 @@ if (in_array($path, $publicRoutes)) {
 
 // Protected routes - require authentication
 if (!isset($_SESSION['user_id'])) {
+    error_log("User not authenticated, redirecting to /login");
     header('Location: /login');
+    exit;
+}
+
+// Handle API routes before role-specific routes
+if ($path === 'api/load_data') {
+    error_log("Routing to ApiController::loadData for path: $path");
+    require_once __DIR__ . '/../src/controllers/ApiController.php';
+    $controller = new ApiController();
+    $controller->loadData();
     exit;
 }
 
@@ -246,6 +319,7 @@ switch ($roleId) {
         handleFacultyRoutes($path);
         break;
     default:
+        error_log("Unauthorized role: $roleId");
         http_response_code(403);
         echo "Unauthorized role";
         exit;
@@ -255,4 +329,3 @@ switch ($roleId) {
 http_response_code(404);
 echo "Page not found";
 exit;
-?>

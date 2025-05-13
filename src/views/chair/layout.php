@@ -25,16 +25,16 @@ $currentUri = $_SERVER['REQUEST_URI'];
                 extend: {
                     colors: {
                         gold: {
-                            50: '#FEF9E7',
-                            100: '#FCF3CF',
-                            200: '#F9E79F',
-                            300: '#F7DC6F',
-                            400: '#F5D33F',
-                            500: '#D4AF37',
-                            600: '#B8860B',
-                            700: '#9A7209',
-                            800: '#7C5E08',
-                            900: '#5E4506',
+                            50: '#FEF9E8',
+                            100: '#FDF0C4',
+                            200: '#FAE190',
+                            300: '#F7D15C',
+                            400: '#F4C029',
+                            500: '#E5AD0F',
+                            600: '#B98A0C',
+                            700: '#8E6809',
+                            800: '#624605',
+                            900: '#352503',
                         },
                         gray: {
                             50: '#F9FAFB',
@@ -336,11 +336,6 @@ $currentUri = $_SERVER['REQUEST_URI'];
 
             <!-- Right: User Profile and Notifications -->
             <div class="flex items-center space-x-4">
-                <!-- Notifications -->
-                <button class="relative text-gray-600 hover:text-gold-500 focus:outline-none">
-                    <i class="fas fa-bell text-xl"></i>
-                    <span class="notification-badge">3</span>
-                </button>
 
                 <!-- User Profile Dropdown -->
                 <div class="dropdown relative">
@@ -412,10 +407,10 @@ $currentUri = $_SERVER['REQUEST_URI'];
                     <i class="fas fa-chevron-down text-xs transition-transform duration-300 toggle-icon"></i>
                 </button>
                 <div class="dropdown-menu ml-5 mt-1 rounded-md flex-col bg-gray-800/80 overflow-hidden">
-                    <a href="/chair/schedule/create" class="flex items-center px-4 py-3 text-gray-300 hover:bg-gray-700 hover:text-gold-300 transition duration-300 rounded-md <?= strpos($currentUri, '/chair/schedule/create') !== false ? 'bg-gray-700 text-gold-300' : '' ?>">
+                    <a href="/chair/schedule_management" class="flex items-center px-4 py-3 text-gray-300 hover:bg-gray-700 hover:text-gold-300 transition duration-300 rounded-md <?= strpos($currentUri, '/chair/schedule/create') !== false ? 'bg-gray-700 text-gold-300' : '' ?>">
                         <i class="fas fa-plus-circle w-5 mr-2"></i> Create Schedule
                     </a>
-                    <a href="/chair/schedule" class="flex items-center px-4 py-3 text-gray-300 hover:bg-gray-700 hover:text-gold-300 transition duration-300 rounded-md <?= strpos($currentUri, '/chair/schedule') !== false && strpos($currentUri, '/create') === false && strpos($currentUri, '/history') === false ? 'bg-gray-700 text-gold-300' : '' ?>">
+                    <a href="/chair/my_schedule" class="flex items-center px-4 py-3 text-gray-300 hover:bg-gray-700 hover:text-gold-300 transition duration-300 rounded-md <?= strpos($currentUri, '/chair/schedule') !== false && strpos($currentUri, '/create') === false && strpos($currentUri, '/history') === false ? 'bg-gray-700 text-gold-300' : '' ?>">
                         <i class="fas fa-list w-5 mr-2"></i> My Schedule
                     </a>
                     <a href="/chair/schedule/history" class="flex items-center px-4 py-3 text-gray-300 hover:bg-gray-700 hover:text-gold-300 transition duration-300 rounded-md <?= strpos($currentUri, '/chair/schedule/history') !== false ? 'bg-gray-700 text-gold-300' : '' ?>">

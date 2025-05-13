@@ -1,5 +1,9 @@
 <?php
 require_once __DIR__ . '/../config/Database.php';
+require_once __DIR__ . '/../../vendor/autoload.php'; // Make sure to install PhpSpreadsheet via Composer
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PhpOffice\PhpSpreadsheet\Style\Alignment;
 
 class ChairController
 {
@@ -127,7 +131,7 @@ class ChairController
 
             // Get curricula with active status
             $curriculaStmt = $this->db->prepare("
-                SELECT c.curriculum_id, c.curriculum_name, c.status, p.program_name 
+                SELECT c.curriculum_id, c.curriculum_name, c.total_units, c.status, p.program_name 
                 FROM curricula c 
                 JOIN programs p ON c.department_id = p.department_id 
                 WHERE c.department_id = :department_id
@@ -226,6 +230,9 @@ class ChairController
         error_log("mySchedule: Starting mySchedule method");
         try {
             $chairId = $_SESSION['user_id'];
+            error_log("my schedule: Starting my Schedule method for user_id: $chairId");
+
+            // Get department for the Chair
             $departmentId = $this->getChairDepartment($chairId);
             if (!$departmentId) {
                 error_log("mySchedule: No department found for chairId: $chairId");
@@ -271,228 +278,474 @@ class ChairController
         }
     }
 
-    /**
-     * Create a new schedule manually
-     */
-    public function createSchedule()
+    private function getCurrentSemester()
     {
-        error_log("createSchedule: Starting createSchedule method");
-        $chairId = $_SESSION['user_id'];
-        $departmentId = $this->getChairDepartment($chairId);
+        // First, try to find the semester marked as current
+        $stmt = $this->db->prepare("SELECT semester_id, CONCAT(semester_name, ' ', academic_year) AS semester_name 
+                                   FROM semesters 
+                                   WHERE is_current = 1");
+        $stmt->execute();
+        $semester = $stmt->fetch(PDO::FETCH_ASSOC);
 
-        if (!$departmentId) {
-            error_log("createSchedule: No department found for chairId: $chairId");
-            $error = "No department assigned to this chair.";
-            require_once __DIR__ . '/../views/chair/create_schedule.php';
-            return;
+        // If no semester is marked as current, fall back to date range
+        if (!$semester) {
+            $stmt = $this->db->prepare("SELECT semester_id, CONCAT(semester_name, ' ', academic_year) AS semester_name 
+                                       FROM semesters 
+                                       WHERE CURRENT_DATE BETWEEN start_date AND end_date");
+            $stmt->execute();
+            $semester = $stmt->fetch(PDO::FETCH_ASSOC);
         }
 
-        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-            try {
-                $data = [
-                    'course_id' => intval($_POST['course_id'] ?? 0),
-                    'faculty_id' => intval($_POST['faculty_id'] ?? 0),
-                    'room_id' => intval($_POST['room_id'] ?? 0),
-                    'section_id' => intval($_POST['section_id'] ?? 0),
-                    'schedule_type' => $_POST['schedule_type'] ?? 'F2F',
-                    'day_of_week' => $_POST['day_of_week'] ?? '',
-                    'start_time' => $_POST['start_time'] ?? '',
-                    'end_time' => $_POST['end_time'] ?? '',
-                    'semester_id' => intval($_POST['semester_id'] ?? 0)
-                ];
-
-                error_log("createSchedule: POST data - " . json_encode($data));
-
-                $errors = [];
-                // Validate course belongs to department
-                $courseStmt = $this->db->prepare("SELECT course_id FROM courses WHERE course_id = :course_id AND department_id = :department_id");
-                $courseStmt->execute([':course_id' => $data['course_id'], ':department_id' => $departmentId]);
-                if (!$courseStmt->fetchColumn()) {
-                    $errors[] = "Invalid course selected or not in your department.";
-                }
-                // Validate faculty belongs to department
-                $facultyStmt = $this->db->prepare("SELECT f.faculty_id FROM faculty f JOIN users u ON f.user_id = u.user_id 
-                                                  WHERE f.faculty_id = :faculty_id AND u.department_id = :department_id");
-                $facultyStmt->execute([':faculty_id' => $data['faculty_id'], ':department_id' => $departmentId]);
-                if (!$facultyStmt->fetchColumn()) {
-                    $errors[] = "Invalid faculty selected or not in your department.";
-                }
-                // Validate section belongs to department
-                $sectionStmt = $this->db->prepare("SELECT section_id FROM sections WHERE section_id = :section_id AND department_id = :department_id");
-                $sectionStmt->execute([':section_id' => $data['section_id'], ':department_id' => $departmentId]);
-                if (!$courseStmt->fetchColumn()) {
-                    $errors[] = "Invalid section selected or not in your department.";
-                }
-                if (!in_array($data['day_of_week'], ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'])) {
-                    $errors[] = "Invalid day of week.";
-                }
-                if (!preg_match('/^\d{2}:\d{2}$/', $data['start_time']) || !preg_match('/^\d{2}:\d{2}$/', $data['end_time'])) {
-                    $errors[] = "Invalid time format.";
-                }
-                if ($data['semester_id'] < 1) {
-                    $errors[] = "Invalid semester selected.";
-                }
-                if (!in_array($data['schedule_type'], ['F2F', 'Online', 'Hybrid', 'Asynchronous'])) {
-                    $errors[] = "Invalid schedule type.";
-                }
-                if ($data['schedule_type'] !== 'Asynchronous' && $data['room_id'] < 1) {
-                    $errors[] = "Room is required for non-asynchronous schedules.";
-                }
-
-                if (empty($errors)) {
-                    error_log("createSchedule: Validated data, calling SchedulingService");
-                    // Call SchedulingService to create schedule
-                    $response = $this->callSchedulingService('POST', 'create-schedule', $data);
-
-                    if ($response['code'] !== 200 || !isset($response['data']['success'])) {
-                        error_log("createSchedule: Failed to create schedule - " . ($response['data']['error'] ?? 'Unknown error'));
-                        throw new Exception($response['data']['error'] ?? "Failed to create schedule.");
-                    }
-
-                    error_log("createSchedule: Schedule created successfully");
-                    header('Location: /chair/schedule?success=Schedule created successfully');
-                    exit;
-                } else {
-                    error_log("createSchedule: Validation errors - " . implode(", ", $errors));
-                    $error = implode("<br>", $errors);
-                }
-            } catch (Exception $e) {
-                error_log("createSchedule: Error - " . $e->getMessage());
-                $error = $e->getMessage();
-            }
-        }
-
-        try {
-            error_log("createSchedule: Fetching form data for chairId: $chairId, departmentId: $departmentId");
-
-            $courses = $this->db->query("SELECT course_id, course_code, course_name FROM courses WHERE department_id = " . (int)$departmentId)->fetchAll(PDO::FETCH_ASSOC);
-            $faculty = $this->db->query("SELECT f.faculty_id, CONCAT(u.first_name, ' ', u.last_name) AS name 
-                                         FROM faculty f JOIN users u ON f.user_id = u.user_id 
-                                         WHERE u.department_id = " . (int)$departmentId)->fetchAll(PDO::FETCH_ASSOC);
-            $classrooms = $this->db->query("SELECT room_id, room_name FROM classrooms")->fetchAll(PDO::FETCH_ASSOC);
-            $sections = $this->db->query("SELECT section_id, section_name FROM sections WHERE department_id = " . (int)$departmentId)->fetchAll(PDO::FETCH_ASSOC);
-            $semesters = $this->db->query("SELECT semester_id, CONCAT(semester_name, ' ', academic_year) AS semester_name FROM semesters")->fetchAll(PDO::FETCH_ASSOC);
-
-            error_log("createSchedule: Form data fetched, loading view");
-            require_once __DIR__ . '/../views/chair/create_schedule.php';
-        } catch (PDOException $e) {
-            error_log("createSchedule: Error loading form data - " . $e->getMessage());
-            $error = "Failed to load form data.";
-            require_once __DIR__ . '/../views/chair/create_schedule.php';
-        }
+        return $semester;
     }
 
-    /**
-     * Generate schedules automatically
-     */
-    public function generateSchedule()
+    private function exportTimetableToExcel($schedules, $filename, $roomName, $semesterName)
     {
-        error_log("generateSchedule: Starting generateSchedule method");
-        $chairId = $_SESSION['user_id'];
-        $departmentId = $this->getChairDepartment($chairId);
+        $spreadsheet = new Spreadsheet();
+        $sheet = $spreadsheet->getActiveSheet();
 
-        if (!$departmentId) {
-            error_log("generateSchedule: No department found for chairId: $chairId");
-            $error = "No department assigned to this chair.";
-            require_once __DIR__ . '/../views/chair/generate_schedule.php';
-            return;
+        // Set title and headers
+        $sheet->mergeCells('A1:E1');
+        $sheet->setCellValue('A1', 'Republic of the Philippines');
+        $sheet->mergeCells('A2:E2');
+        $sheet->setCellValue('A2', 'PRESIDENT RAMON MAGSAYSAY STATE UNIVERSITY');
+        $sheet->mergeCells('A3:E3');
+        $sheet->setCellValue('A3', '(Formerly Ramon Magsaysay Technological University)');
+        $sheet->mergeCells('A4:E4');
+        $sheet->setCellValue('A4', 'COMPUTER LABORATORY SCHEDULE');
+        $sheet->mergeCells('A5:E5');
+        $sheet->setCellValue('A5', $semesterName);
+        $sheet->mergeCells('A6:E6');
+        $sheet->setCellValue('A6', strtoupper($roomName));
+
+        // Faculty in-charge (placeholder)
+        $sheet->setCellValue('A7', 'Faculty-in-charge:');
+        $sheet->mergeCells('B7:E7');
+
+        // Time slots and days
+        $days = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY'];
+        $times = [
+            '7:30 - 8:00',
+            '8:00 - 9:00',
+            '9:00 - 10:00',
+            '10:00 - 11:00',
+            '11:00 - 12:00',
+            '12:00 - 1:00',
+            '1:00 - 2:00',
+            '2:00 - 3:00',
+            '3:00 - 4:00',
+            '4:00 - 5:00'
+        ];
+
+        $sheet->setCellValue('A9', 'TIME');
+        for ($i = 0; $i < count($days); $i++) {
+            $cell = chr(66 + $i) . '9'; // Convert column index to letter (B, C, D, etc.)
+            $sheet->setCellValue($cell, $days[$i]);
         }
 
-        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-            try {
-                $semesterId = intval($_POST['semester_id'] ?? 0);
-                if ($semesterId < 1) {
-                    throw new Exception("Invalid semester selected.");
+        $row = 10;
+        foreach ($times as $time) {
+            $sheet->setCellValue('A' . $row, $time);
+            $row++;
+        }
+
+        // Populate schedule data
+        $row = 10;
+        foreach ($times as $time) {
+            foreach ($days as $index => $day) {
+                $cell = chr(66 + $index) . $row; // B, C, D, E columns
+                foreach ($schedules as $schedule) {
+                    if ($schedule['start_time'] === substr($time, 0, 5) && $schedule['day_of_week'] === $day) {
+                        $sheet->setCellValue($cell, $schedule['course_code'] . ' - ' . $schedule['faculty_name']);
+                    }
                 }
+                $sheet->getStyle($cell)->getAlignment()->setWrapText(true);
+            }
+            $row++;
+        }
 
-                error_log("generateSchedule: Generating schedule for department_id: $departmentId, semester_id: $semesterId");
+        // Auto-size columns
+        foreach (range('A', 'E') as $col) {
+            $sheet->getColumnDimension($col)->setAutoSize(true);
+        }
 
-                // Fetch data for scheduling
-                $courses = $this->db->query("SELECT course_id, course_code, course_name FROM courses WHERE department_id = " . (int)$departmentId)->fetchAll(PDO::FETCH_ASSOC);
-                $faculty = $this->db->query("SELECT f.faculty_id, CONCAT(u.first_name, ' ', u.last_name) AS name 
-                                             FROM faculty f JOIN users u ON f.user_id = u.user_id 
-                                             WHERE u.department_id = " . (int)$departmentId)->fetchAll(PDO::FETCH_ASSOC);
-                $classrooms = $this->db->query("SELECT room_id, room_name FROM classrooms")->fetchAll(PDO::FETCH_ASSOC);
-                $sections = $this->db->query("SELECT section_id, section_name FROM sections WHERE department_id = " . (int)$departmentId)->fetchAll(PDO::FETCH_ASSOC);
+        // Style headers
+        $sheet->getStyle('A1:E6')->getFont()->setBold(true);
+        $sheet->getStyle('A9:E9')->getFont()->setBold(true);
+        $sheet->getStyle('A1:E6')->getAlignment()->setHorizontal(Alignment::HORIZONTAL_CENTER);
 
-                // Define time slots (Monday to Saturday, 8:00 AM to 5:00 PM, 2-hour blocks)
-                $days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-                $timeSlots = ['08:00', '10:00', '13:00', '15:00'];
+        // Write to file
+        $writer = new Xlsx($spreadsheet);
+        header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        header('Content-Disposition: attachment;filename="' . $filename . '.xlsx"');
+        header('Cache-Control: max-age=0');
+        $writer->save('php://output');
+        exit;
+    }
 
-                $schedules = [];
-                foreach ($sections as $section) {
-                    foreach ($courses as $course) {
-                        // Randomly assign faculty, room, day, and time
-                        $facultyId = $faculty[array_rand($faculty)]['faculty_id'];
-                        $roomId = $classrooms[array_rand($classrooms)]['room_id'];
-                        $day = $days[array_rand($days)];
-                        $startTime = $timeSlots[array_rand($timeSlots)];
-                        $endTime = date('H:i', strtotime($startTime . ' +2 hours'));
+    private function exportPlainExcel($courses, $faculty, $rooms, $sections, $filename)
+    {
+        $spreadsheet = new Spreadsheet();
+        $sheet = $spreadsheet->getActiveSheet();
 
-                        // Check for conflicts
-                        $conflictStmt = $this->db->prepare("
-                            SELECT COUNT(*) FROM schedules 
-                            WHERE semester_id = :semester_id 
-                            AND (faculty_id = :faculty_id OR room_id = :room_id)
-                            AND day_of_week = :day_of_week
-                            AND (
-                                (start_time <= :start_time AND end_time > :start_time) OR
-                                (start_time < :end_time AND end_time >= :end_time) OR
-                                (start_time >= :start_time AND end_time <= :end_time)
-                            )
-                        ");
-                        $conflictStmt->execute([
-                            ':semester_id' => $semesterId,
-                            ':faculty_id' => $facultyId,
-                            ':room_id' => $roomId,
-                            ':day_of_week' => $day,
-                            ':start_time' => $startTime,
-                            ':end_time' => $endTime
-                        ]);
-                        if ($conflictStmt->fetchColumn() > 0) {
-                            error_log("generateSchedule: Conflict detected for course_id: {$course['course_id']}, section_id: {$section['section_id']}");
-                            continue; // Skip if conflict exists
+        // Headers
+        $sheet->setCellValue('A1', 'Course Code');
+        $sheet->setCellValue('B1', 'Course Name');
+        $sheet->setCellValue('C1', 'Faculty Name');
+        $sheet->setCellValue('D1', 'Room Name');
+        $sheet->setCellValue('E1', 'Section Name');
+        $sheet->setCellValue('F1', 'Day of Week');
+        $sheet->setCellValue('G1', 'Start Time');
+        $sheet->setCellValue('H1', 'End Time');
+
+        // Populate with available resources
+        $row = 2;
+        foreach ($courses as $course) {
+            $sheet->setCellValue('A' . $row, $course['course_code']);
+            $sheet->setCellValue('B' . $row, $course['course_name']);
+            $row++;
+        }
+        $row = 2;
+        foreach ($faculty as $fac) {
+            $sheet->setCellValue('C' . $row, $fac['name']);
+            $row++;
+        }
+        $row = 2;
+        foreach ($rooms as $room) {
+            $sheet->setCellValue('D' . $row, $room['room_name']);
+            $row++;
+        }
+        $row = 2;
+        foreach ($sections as $section) {
+            $sheet->setCellValue('E' . $row, $section['section_name']);
+            $row++;
+        }
+
+        // Add days and times as dropdown options
+        $days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'];
+        $times = ['07:30', '08:00', '09:00', '10:00', '11:00', '12:00', '13:00', '14:00', '15:00', '16:00'];
+        $sheet->setCellValue('F2', implode(', ', $days));
+        $sheet->setCellValue('G2', implode(', ', $times));
+        $sheet->setCellValue('H2', implode(', ', $times));
+
+        foreach (range('A', 'H') as $col) {
+            $sheet->getColumnDimension($col)->setAutoSize(true);
+        }
+        $sheet->getStyle('A1:H1')->getFont()->setBold(true);
+
+        $writer = new Xlsx($spreadsheet);
+        header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        header('Content-Disposition: attachment;filename="' . $filename . '.xlsx"');
+        header('Cache-Control: max-age=0');
+        $writer->save('php://output');
+        exit;
+    }
+
+    private function validateCurriculumCourse($curriculumId, $courseId)
+    {
+        $stmt = $this->db->prepare("SELECT 1 FROM curriculum_courses 
+                                  WHERE curriculum_id = :curriculum_id 
+                                  AND course_id = :course_id");
+        $stmt->execute([':curriculum_id' => $curriculumId, ':course_id' => $courseId]);
+        return $stmt->fetchColumn();
+    }
+
+    private function validateCurriculumSection($curriculumId, $sectionId)
+    {
+        $currentSemester = $this->getCurrentSemester();
+        $stmt = $this->db->prepare("
+            SELECT 1 FROM sections 
+            WHERE section_id = :section_id 
+            AND curriculum_id = :curriculum_id
+            AND semester = :semester
+            AND is_active = 1
+        ");
+        $stmt->execute([
+            ':section_id' => $sectionId,
+            ':curriculum_id' => $curriculumId,
+            ':semester' => $currentSemester['semester_name']
+        ]);
+        return $stmt->fetchColumn();
+    }
+
+    public function manageSchedule()
+    {
+        $chairId = $_SESSION['user_id'];
+        $departmentId = $this->getChairDepartment($chairId);
+        $currentSemester = $this->getCurrentSemester();
+        $activeTab = $_GET['tab'] ?? 'manual';
+        $error = null;
+        $schedules = [];
+
+        try {
+            $selectedCurriculumId = $_POST['curriculum_id'] ?? ($_GET['curriculum_id'] ?? null);
+            // Load common data
+            $curricula = $this->db->prepare("
+                SELECT curriculum_id, curriculum_name 
+                FROM curricula 
+                WHERE department_id = :dept_id 
+                AND status = 'Active'
+            ");
+            $curricula->execute([':dept_id' => $departmentId]);
+            $curricula = $curricula->fetchAll();
+
+            // Get available classrooms
+            $classrooms = $this->db->prepare("
+                SELECT room_id, room_name 
+                FROM classrooms 
+                WHERE (department_id = :dept_id OR shared = 1) 
+                AND availability = 'available'
+            ");
+            $classrooms->execute([':dept_id' => $departmentId]);
+            $classrooms = $classrooms->fetchAll();
+
+            // Get courses for the selected curriculum
+            $courses = $this->db->prepare("
+            SELECT 
+                c.course_id,
+                c.course_code,
+                c.course_name,
+                cc.curriculum_id,
+                cc.year_level AS curriculum_year,
+                cc.semester AS curriculum_semester
+            FROM curriculum_courses cc
+            JOIN courses c ON cc.course_id = c.course_id
+            WHERE cc.curriculum_id = :curriculum_id
+            ORDER BY 
+                FIELD(cc.year_level, '1st Year', '2nd Year', '3rd Year', '4th Year'),
+                FIELD(cc.semester, '1st', '2nd', 'Summer'),
+                c.course_code
+        ");
+            $courses->execute([':curriculum_id' => $selectedCurriculumId]);
+            $courses = $courses->fetchAll(PDO::FETCH_ASSOC);
+
+            if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+                if ($activeTab === 'manual') {
+                    $schedulesData = json_decode($_POST['schedules'], true);
+
+                    foreach ($schedulesData as $schedule) {
+                        $errors = [];
+                        $curriculumId = $schedule['curriculum_id'] ?? 0;
+
+                        // Validate curriculum course
+                        if (!$this->validateCurriculumCourse($curriculumId, $schedule['course_id'])) {
+                            $errors[] = "Course doesn't belong to selected curriculum";
                         }
 
-                        // Add schedule
-                        $data = [
-                            'course_id' => $course['course_id'],
-                            'faculty_id' => $facultyId,
-                            'room_id' => $roomId,
-                            'section_id' => $section['section_id'],
-                            'schedule_type' => 'F2F',
-                            'day_of_week' => $day,
-                            'start_time' => $startTime,
-                            'end_time' => $endTime,
-                            'semester_id' => $semesterId
-                        ];
-                        $response = $this->callSchedulingService('POST', 'create-schedule', $data);
-                        if ($response['code'] === 200 && isset($response['data']['success'])) {
-                            $schedules[] = $data;
-                        } else {
-                            error_log("generateSchedule: Failed to create schedule for course_id: {$course['course_id']} - " . ($response['data']['error'] ?? 'Unknown error'));
+                        // Validate curriculum section
+                        if (!$this->validateCurriculumSection($curriculumId, $schedule['section_id'])) {
+                            $errors[] = "Section doesn't belong to selected curriculum or is inactive";
+                        }
+
+                        // Validate room availability
+                        $roomAvailable = $this->db->prepare("
+                            SELECT 1 FROM classrooms 
+                            WHERE room_id = :room_id 
+                            AND availability = 'available'
+                        ");
+                        $roomAvailable->execute([':room_id' => $schedule['room_id']]);
+
+                        if (!$roomAvailable->fetchColumn()) {
+                            $errors[] = "Selected room is not available";
+                        }
+
+                        if (empty($errors)) {
+                            $response = $this->callSchedulingService('POST', 'schedules', [
+                                'course_id' => $schedule['course_id'],
+                                'faculty_id' => $schedule['faculty_id'],
+                                'room_id' => $schedule['room_id'],
+                                'section_id' => $schedule['section_id'],
+                                'day_of_week' => $schedule['day_of_week'],
+                                'start_time' => $schedule['start_time'],
+                                'end_time' => $schedule['end_time'],
+                                'semester_id' => $currentSemester['semester_id'],
+                                'curriculum_id' => $curriculumId
+                            ]);
+
+                            if ($response['code'] === 200) {
+                                $schedules[] = $response['data'];
+                            }
+                        }
+                    }
+                } elseif ($activeTab === 'generate') {
+                    $curriculumId = $_POST['curriculum_id'];
+                    $yearLevels = $_POST['year_levels'] ?? [];
+
+                    // Get curriculum courses
+                    $courses = $this->db->prepare("
+                        SELECT 
+                            c.course_id,
+                            c.course_code,
+                            c.course_name,
+                            cc.curriculum_id,
+                            cc.year_level AS curriculum_year,
+                            cc.semester AS curriculum_semester,
+                            cc.subject_type
+                        FROM curriculum_courses cc
+                        JOIN courses c ON cc.course_id = c.course_id
+                        JOIN curricula cr ON cc.curriculum_id = cr.curriculum_id
+                        WHERE cr.curriculum_id = :curriculum_id
+                        AND cr.status = 'Active'
+                        ORDER BY
+                            FIELD(cc.year_level, '1st Year', '2nd Year', '3rd Year', '4th Year'),
+                            FIELD(cc.semester, '1st', '2nd', 'Summer'),
+                            c.course_code
+                    ");
+                    $courses->execute([':curriculum_id' => $curriculumId]);
+                    $courses = $courses->fetchAll(PDO::FETCH_ASSOC);
+
+                    // Get all active sections for the current curriculum, semester, and department
+                    $sections = $this->db->prepare("
+                        SELECT 
+                            section_id,
+                            section_name,
+                            year_level,
+                            curriculum_id,
+                            max_students
+                        FROM sections
+                        WHERE curriculum_id = :curriculum_id
+                        AND department_id = :department_id
+                        AND semester = :semester
+                        AND is_active = 1
+                        ORDER BY 
+                            FIELD(year_level, '1st Year', '2nd Year', '3rd Year', '4th Year'),
+                            section_name
+                    ");
+                    $sections->execute([
+                        ':curriculum_id' => $curriculumId,
+                        ':department_id' => $departmentId,
+                        ':semester' => $currentSemester['semester_name']
+                    ]);
+                    $sections = $sections->fetchAll(PDO::FETCH_ASSOC);
+
+                    // Generate schedule logic
+                    foreach ($sections as $section) {
+                        foreach ($courses as $course) {
+                            // Check if course matches section year level and semester
+                            if (
+                                $course['curriculum_year'] !== $section['year_level'] ||
+                                $course['curriculum_semester'] !== $currentSemester['semester_name']
+                            ) {
+                                continue;
+                            }
+
+                            // Find available room
+                            $room = $this->db->prepare("
+                                SELECT room_id, room_name 
+                                FROM classrooms 
+                                WHERE (department_id = :dept_id OR shared = 1)
+                                AND availability = 'available'
+                                AND capacity >= :students
+                                ORDER BY RAND() LIMIT 1
+                            ");
+                            $room->execute([
+                                ':dept_id' => $departmentId,
+                                ':students' => $section['max_students']
+                            ]);
+                            $room = $room->fetch();
+
+                            if (!$room) continue;
+
+                            // Schedule creation logic
+                            $scheduleData = [
+                                'course_id' => $course['course_id'],
+                                'faculty_id' => $this->getAvailableFaculty($departmentId),
+                                'room_id' => $room['room_id'],
+                                'section_id' => $section['section_id'],
+                                'day_of_week' => $this->getRandomDay(),
+                                'start_time' => $this->getRandomTimeSlot(),
+                                'end_time' => $this->getEndTime($this->getRandomTimeSlot()),
+                                'semester_id' => $currentSemester['semester_id'],
+                                'curriculum_id' => $curriculumId
+                            ];
+
+                            $response = $this->callSchedulingService('POST', 'schedules', $scheduleData);
+                            if ($response['code'] === 200) {
+                                $schedules[] = $response['data'];
+                            }
                         }
                     }
                 }
-
-                error_log("generateSchedule: Generated " . count($schedules) . " schedules");
-                header('Location: /chair/schedule?success=Automatically generated ' . count($schedules) . ' schedules');
-                exit;
-            } catch (Exception $e) {
-                error_log("generateSchedule: Error - " . $e->getMessage());
-                $error = $e->getMessage();
             }
+
+            // Load view data
+            $courses = $this->db->prepare("
+                SELECT c.* 
+                FROM courses c
+                JOIN curriculum_courses cc ON c.course_id = cc.course_id
+                WHERE c.department_id = :dept_id
+            ");
+            $courses->execute([':dept_id' => $departmentId]);
+            $courses = $courses->fetchAll();
+
+            $faculty = $this->db->prepare("
+                SELECT f.faculty_id, CONCAT(u.first_name, ' ', u.last_name) AS name 
+                FROM faculty f
+                JOIN users u ON f.user_id = u.user_id
+                WHERE u.department_id = :dept_id
+            ");
+            $faculty->execute([':dept_id' => $departmentId]);
+            $faculty = $faculty->fetchAll();
+
+            $sections = $this->db->prepare("
+                SELECT s.*, c.curriculum_name 
+                FROM sections s
+                JOIN curricula c ON s.curriculum_id = c.curriculum_id
+                WHERE s.department_id = :department_id
+                AND s.semester = :semester
+                AND s.is_active = 1
+            ");
+            $sections->execute([
+                ':department_id' => $departmentId,
+                ':semester' => $currentSemester['semester_name']
+            ]);
+            $sections = $sections->fetchAll();
+
+            $semesters = $this->db->query("SELECT * FROM semesters")->fetchAll();
+        } catch (PDOException $e) {
+            $error = "Database error: " . $e->getMessage();
+        } catch (Exception $e) {
+            $error = "Error: " . $e->getMessage();
         }
 
-        try {
-            $semesters = $this->db->query("SELECT semester_id, CONCAT(semester_name, ' ', academic_year) AS semester_name FROM semesters")->fetchAll(PDO::FETCH_ASSOC);
-            error_log("generateSchedule: Form data fetched, loading view");
-            require_once __DIR__ . '/../views/chair/generate_schedule.php';
-        } catch (PDOException $e) {
-            error_log("generateSchedule: Error loading form data - " . $e->getMessage());
-            $error = "Failed to load form data.";
-            require_once __DIR__ . '/../views/chair/generate_schedule.php';
-        }
+        require_once __DIR__ . '/../views/chair/schedule_management.php';
+    }
+
+    private function getAvailableFaculty($departmentId)
+    {
+        $stmt = $this->db->prepare("
+            SELECT faculty_id 
+            FROM faculty 
+            WHERE department_id = :dept_id 
+            ORDER BY RAND() LIMIT 1
+        ");
+        $stmt->execute([':dept_id' => $departmentId]);
+        return $stmt->fetchColumn();
+    }
+
+    private function getRandomDay()
+    {
+        $days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'];
+        return $days[array_rand($days)];
+    }
+
+    private function getRandomTimeSlot()
+    {
+        $slots = ['07:30', '08:30', '09:30', '10:30', '13:00', '14:00'];
+        return $slots[array_rand($slots)];
+    }
+
+    private function getEndTime($startTime)
+    {
+        $timeMap = [
+            '07:30' => '08:30',
+            '08:30' => '09:30',
+            '09:30' => '10:30',
+            '10:30' => '11:30',
+            '13:00' => '14:00',
+            '14:00' => '15:00'
+        ];
+        return $timeMap[$startTime] ?? '15:00';
     }
 
     /**
@@ -619,7 +872,6 @@ class ChairController
         }
     }
 
-
     /**
      * Manage curriculum
      */
@@ -684,9 +936,10 @@ class ChairController
                 return;
             }
 
-            $error = null;
-            $success = null;
-            
+            // Pagination settings
+            $perPage = 15; // Number of courses per page
+            $page = isset($_GET['page']) ? max(1, intval($_GET['page'])) : 1;
+            $offset = ($page - 1) * $perPage;
 
             // Handle form submissions for adding/editing courses
             if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -721,28 +974,28 @@ class ChairController
                         if ($courseId > 0) {
                             // Update existing course
                             $stmt = $this->db->prepare("UPDATE courses SET 
-                            course_code = :course_code, 
-                            course_name = :course_name, 
-                            department_id = :department_id, 
-                            program_id = :program_id, 
-                            units = :units, 
-                            lecture_units = :lecture_units,
-                            lab_units = :lab_units,
-                            lecture_hours = :lecture_hours, 
-                            lab_hours = :lab_hours, 
-                            is_active = :is_active 
-                            WHERE course_id = :course_id");
+                                course_code = :course_code, 
+                                course_name = :course_name, 
+                                department_id = :department_id, 
+                                program_id = :program_id, 
+                                units = :units, 
+                                lecture_units = :lecture_units,
+                                lab_units = :lab_units,
+                                lecture_hours = :lecture_hours, 
+                                lab_hours = :lab_hours, 
+                                is_active = :is_active 
+                                WHERE course_id = :course_id");
                             $data['course_id'] = $courseId;
                             $stmt->execute($data);
                             $success = "Course updated successfully.";
                         } else {
                             // Add new course
                             $stmt = $this->db->prepare("INSERT INTO courses 
-                            (course_code, course_name, department_id, program_id, units, 
-                            lecture_units, lab_units, lecture_hours, lab_hours, is_active) 
-                            VALUES 
-                            (:course_code, :course_name, :department_id, :program_id, :units, 
-                            :lecture_units, :lab_units, :lecture_hours, :lab_hours, :is_active)");
+                                (course_code, course_name, department_id, program_id, units, 
+                                lecture_units, lab_units, lecture_hours, lab_hours, is_active) 
+                                VALUES 
+                                (:course_code, :course_name, :department_id, :program_id, :units, 
+                                :lecture_units, :lab_units, :lecture_hours, :lab_hours, :is_active)");
                             $stmt->execute($data);
                             $success = "Course added successfully.";
                         }
@@ -772,13 +1025,23 @@ class ChairController
                 }
             }
 
-            // Fetch courses
+            // Fetch total number of courses for pagination
+            $totalStmt = $this->db->prepare("SELECT COUNT(*) FROM courses WHERE department_id = :department_id");
+            $totalStmt->execute([':department_id' => $departmentId]);
+            $totalCourses = $totalStmt->fetchColumn();
+            $totalPages = ceil($totalCourses / $perPage);
+
+            // Fetch courses with pagination
             $coursesStmt = $this->db->prepare("SELECT c.*, p.program_name 
-            FROM courses c 
-            LEFT JOIN programs p ON c.program_id = p.program_id 
-            WHERE c.department_id = :department_id
-            ORDER BY c.course_code");
-            if ($coursesStmt->execute([':department_id' => $departmentId])) {
+                FROM courses c 
+                LEFT JOIN programs p ON c.program_id = p.program_id 
+                WHERE c.department_id = :department_id
+                ORDER BY c.course_code
+                LIMIT :offset, :perPage");
+            $coursesStmt->bindValue(':department_id', $departmentId, PDO::PARAM_INT);
+            $coursesStmt->bindValue(':offset', $offset, PDO::PARAM_INT);
+            $coursesStmt->bindValue(':perPage', $perPage, PDO::PARAM_INT);
+            if ($coursesStmt->execute()) {
                 $courses = $coursesStmt->fetchAll(PDO::FETCH_ASSOC);
             } else {
                 throw new PDOException("Courses query failed: " . implode(', ', $coursesStmt->errorInfo()));
@@ -786,7 +1049,7 @@ class ChairController
 
             // Fetch programs
             $programsStmt = $this->db->prepare("SELECT program_id, program_name 
-            FROM programs WHERE department_id = :department_id");
+                FROM programs WHERE department_id = :department_id");
             if ($programsStmt->execute([':department_id' => $departmentId])) {
                 $programs = $programsStmt->fetchAll(PDO::FETCH_ASSOC);
             } else {
@@ -809,7 +1072,6 @@ class ChairController
                     $error = "Failed to load course for editing: " . $e->getMessage();
                 }
             }
-           
         } catch (PDOException $e) {
             error_log("courses: Error - " . $e->getMessage());
             $error = "Failed to load courses.";
@@ -822,7 +1084,6 @@ class ChairController
     /**
  * Manage faculty
  */
-
 public function faculty()
 {
     $chairId = $_SESSION['user_id'];
@@ -835,32 +1096,78 @@ public function faculty()
     $departments = [];
     $searchResults = [];
 
+    // Get the chair's college_id and the departments under it
+    $departmentIds = [];
+    if ($departmentId) {
+        $collegeStmt = $this->db->prepare("SELECT college_id FROM departments WHERE department_id = :department_id");
+        $collegeStmt->execute([':department_id' => $departmentId]);
+        $collegeId = $collegeStmt->fetchColumn();
+
+        if ($collegeId) {
+            $deptStmt = $this->db->prepare("SELECT department_id FROM departments WHERE college_id = :college_id");
+            $deptStmt->execute([':college_id' => $collegeId]);
+            $departmentIds = $deptStmt->fetchAll(PDO::FETCH_COLUMN);
+        }
+
+        if (empty($departmentIds)) {
+            $error = "No departments found under this chair's college.";
+        }
+    } else {
+        $error = "No department assigned to this chair.";
+        $collegeId = null;
+    }
+
     // Handle AJAX search request for name suggestions
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['name'])) {
         try {
             $name = trim($_POST['name']);
-            $collegeId = isset($_POST['college_id']) ? intval($_POST['college_id']) : 0;
+            $collegeIdSearch = isset($_POST['college_id']) ? intval($_POST['college_id']) : 0;
             $departmentIdSearch = isset($_POST['department_id']) ? intval($_POST['department_id']) : 0;
 
             $query = "
-                SELECT u.user_id, u.employee_id, u.first_name, u.last_name
-                FROM faculty f 
-                JOIN users u ON f.user_id = u.user_id 
-                WHERE (u.first_name LIKE :name OR u.last_name LIKE :name)
+                SELECT 
+                    u.user_id,
+                    u.employee_id,
+                    u.first_name,
+                    u.last_name,
+                    r.role_name,
+                    f.academic_rank,
+                    f.employment_type,
+                    d.department_name,
+                    c.college_name,
+                    pc.program_id,
+                    p.program_name,
+                    deans.college_id AS dean_college_id
+                FROM 
+                    users u
+                    LEFT JOIN roles r ON u.role_id = r.role_id
+                    LEFT JOIN faculty f ON u.user_id = f.user_id
+                    LEFT JOIN departments d ON u.department_id = d.department_id
+                    LEFT JOIN colleges c ON u.college_id = c.college_id
+                    LEFT JOIN program_chairs pc ON u.user_id = pc.user_id AND pc.is_current = 1
+                    LEFT JOIN programs p ON pc.program_id = p.program_id
+                    LEFT JOIN deans ON u.user_id = deans.user_id AND deans.is_current = 1
+                WHERE 
+                    (u.first_name LIKE :name OR u.last_name LIKE :name)
+                    AND (u.role_id IN (4, 5, 6))
             ";
             $params = [':name' => "%$name%"];
 
-            if ($collegeId > 0) {
-                $query .= " AND u.college_id = :college_id";
-                $params[':college_id'] = $collegeId;
+            if ($collegeIdSearch > 0) {
+                $query .= " AND u.college_id = :college_id_search";
+                $params[':college_id_search'] = $collegeIdSearch;
             }
             if ($departmentIdSearch > 0) {
-                $query .= " AND u.department_id = :department_id";
-                $params[':department_id'] = $departmentIdSearch;
+                $query .= " AND u.department_id = :department_id_search";
+                $params[':department_id_search'] = $departmentIdSearch;
             }
-            if ($departmentId) {
-                $query .= " AND u.department_id != :chair_department_id";
-                $params[':chair_department_id'] = $departmentId;
+            if ($collegeId && !empty($departmentIds)) {
+                $placeholders = implode(',', array_map(fn($id) => ":dept_$id", $departmentIds));
+                $query .= " AND u.college_id = :chair_college_id AND u.department_id IN ($placeholders)";
+                $params[':chair_college_id'] = $collegeId;
+                foreach ($departmentIds as $id) {
+                    $params[":dept_$id"] = $id;
+                }
             }
 
             $query .= " ORDER BY u.last_name, u.first_name LIMIT 10";
@@ -868,7 +1175,7 @@ public function faculty()
             $stmt = $this->db->prepare($query);
             $stmt->execute($params);
             $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
-            
+
             header('Content-Type: application/json');
             echo json_encode($results);
             exit;
@@ -879,22 +1186,39 @@ public function faculty()
         }
     }
 
-    // Fetch current faculty members in the chair's department
-    if (!$departmentId) {
-        $error = "No department assigned to this chair.";
-    } else {
+    // Fetch current faculty members in the chair's college (all departments under the college)
+    if ($collegeId && !empty($departmentIds)) {
         try {
-            $facultyStmt = $this->db->prepare("
-                SELECT u.user_id, u.employee_id, u.first_name, u.last_name, f.academic_rank, f.employment_type, d.department_name, c.college_name
-                FROM faculty f 
-                JOIN users u ON f.user_id = u.user_id 
-                JOIN departments d ON u.department_id = d.department_id
-                JOIN colleges c ON u.college_id = c.college_id
-                WHERE u.department_id = :department_id
-                ORDER BY u.last_name, u.first_name
-            ");
-            $facultyStmt->execute([':department_id' => $departmentId]);
-            $faculty = $facultyStmt->fetchAll(PDO::FETCH_ASSOC);
+            $placeholders = implode(',', array_map(fn($id) => ":dept_$id", $departmentIds));
+            $query = "
+                SELECT 
+                    u.user_id, 
+                    u.employee_id, 
+                    u.first_name, 
+                    u.last_name, 
+                    f.academic_rank, 
+                    f.employment_type, 
+                    d.department_name, 
+                    c.college_name
+                FROM 
+                    faculty f 
+                    JOIN users u ON f.user_id = u.user_id 
+                    JOIN departments d ON u.department_id = d.department_id
+                    JOIN colleges c ON u.college_id = c.college_id
+                WHERE 
+                    u.college_id = :college_id 
+                    AND u.department_id IN ($placeholders)
+                ORDER BY 
+                    u.last_name, u.first_name
+            ";
+            $params = [':college_id' => $collegeId];
+            foreach ($departmentIds as $id) {
+                $params[":dept_$id"] = $id;
+            }
+
+            $stmt = $this->db->prepare($query);
+            $stmt->execute($params);
+            $faculty = $stmt->fetchAll(PDO::FETCH_ASSOC);
         } catch (PDOException $e) {
             $error = "Failed to load faculty: " . htmlspecialchars($e->getMessage());
         }
@@ -914,37 +1238,57 @@ public function faculty()
     // Handle search functionality
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['search'])) {
         try {
-            $collegeId = isset($_POST['college_id']) ? intval($_POST['college_id']) : 0;
+            $collegeIdSearch = isset($_POST['college_id']) ? intval($_POST['college_id']) : 0;
             $departmentIdSearch = isset($_POST['department_id']) ? intval($_POST['department_id']) : 0;
             $name = isset($_POST['name']) ? trim($_POST['name']) : '';
 
             $query = "
-                SELECT u.user_id, u.employee_id, u.first_name, u.last_name, f.academic_rank, f.employment_type, d.department_name, c.college_name
-                FROM faculty f 
-                JOIN users u ON f.user_id = u.user_id 
-                JOIN departments d ON u.department_id = d.department_id
-                JOIN colleges c ON u.college_id = c.college_id
-                WHERE 1=1
+                SELECT 
+                    u.user_id,
+                    u.employee_id,
+                    u.first_name,
+                    u.last_name,
+                    r.role_name,
+                    f.academic_rank,
+                    f.employment_type,
+                    d.department_name,
+                    c.college_name,
+                    pc.program_id,
+                    p.program_name,
+                    deans.college_id AS dean_college_id
+                FROM 
+                    users u
+                    LEFT JOIN roles r ON u.role_id = r.role_id
+                    LEFT JOIN faculty f ON u.user_id = f.user_id
+                    LEFT JOIN departments d ON u.department_id = d.department_id
+                    LEFT JOIN colleges c ON u.college_id = c.college_id
+                    LEFT JOIN program_chairs pc ON u.user_id = pc.user_id AND pc.is_current = 1
+                    LEFT JOIN programs p ON pc.program_id = p.program_id
+                    LEFT JOIN deans ON u.user_id = deans.user_id AND deans.is_current = 1
+                WHERE 
+                    (u.role_id IN (4, 5, 6))
             ";
             $params = [];
 
-            if ($collegeId > 0) {
-                $query .= " AND u.college_id = :college_id";
-                $params[':college_id'] = $collegeId;
+            if ($collegeIdSearch > 0) {
+                $query .= " AND u.college_id = :college_id_search";
+                $params[':college_id_search'] = $collegeIdSearch;
             }
             if ($departmentIdSearch > 0) {
-                $query .= " AND u.department_id = :department_id";
-                $params[':department_id'] = $departmentIdSearch;
+                $query .= " AND u.department_id = :department_id_search";
+                $params[':department_id_search'] = $departmentIdSearch;
             }
             if (!empty($name)) {
                 $query .= " AND (u.first_name LIKE :name OR u.last_name LIKE :name)";
                 $params[':name'] = "%$name%";
             }
-
-            // Exclude faculty already in the chair's department
-            if ($departmentId) {
-                $query .= " AND u.department_id != :chair_department_id";
-                $params[':chair_department_id'] = $departmentId;
+            if ($collegeId && !empty($departmentIds)) {
+                $placeholders = implode(',', array_map(fn($id) => ":dept_$id", $departmentIds));
+                $query .= " AND u.college_id = :chair_college_id AND u.department_id IN ($placeholders)";
+                $params[':chair_college_id'] = $collegeId;
+                foreach ($departmentIds as $id) {
+                    $params[":dept_$id"] = $id;
+                }
             }
 
             $query .= " ORDER BY u.last_name, u.first_name";
@@ -962,26 +1306,68 @@ public function faculty()
         try {
             $userId = intval($_POST['user_id']);
             if ($departmentId) {
-                // First check if the user is already in the department
                 $checkStmt = $this->db->prepare("SELECT user_id FROM users WHERE user_id = :user_id AND department_id = :department_id");
                 $checkStmt->execute([':user_id' => $userId, ':department_id' => $departmentId]);
-                
+
                 if ($checkStmt->fetchColumn()) {
                     $error = "This faculty member is already in your department.";
                 } else {
-                    // Update the user's department in the users table
-                    $updateStmt = $this->db->prepare("UPDATE users SET department_id = :department_id WHERE user_id = :user_id");
-                    $updateStmt->execute([':department_id' => $departmentId, ':user_id' => $userId]);
+                    $roleStmt = $this->db->prepare("SELECT role_id FROM users WHERE user_id = :user_id");
+                    $roleStmt->execute([':user_id' => $userId]);
+                    $roleId = $roleStmt->fetchColumn();
 
-                    // Update the faculty's department in the faculty table
-                    $updateFacultyStmt = $this->db->prepare("UPDATE faculty SET department_id = :department_id WHERE user_id = :user_id");
-                    $updateFacultyStmt->execute([':department_id' => $departmentId, ':user_id' => $userId]);
+                    if ($roleId == 6) {
+                        $updateStmt = $this->db->prepare("UPDATE users SET department_id = :department_id WHERE user_id = :user_id");
+                        $updateStmt->execute([':department_id' => $departmentId, ':user_id' => $userId]);
 
-                    $success = "Faculty member added to your department successfully.";
+                        $facultyCheckStmt = $this->db->prepare("SELECT faculty_id FROM faculty WHERE user_id = :user_id");
+                        $facultyCheckStmt->execute([':user_id' => $userId]);
+                        if ($facultyCheckStmt->fetchColumn()) {
+                            $updateFacultyStmt = $this->db->prepare("UPDATE faculty SET department_id = :department_id WHERE user_id = :user_id");
+                            $updateFacultyStmt->execute([':department_id' => $departmentId, ':user_id' => $userId]);
+                        } else {
+                            $insertFacultyStmt = $this->db->prepare("
+                                INSERT INTO faculty (user_id, employee_id, academic_rank, employment_type, department_id)
+                                SELECT user_id, employee_id, 'Instructor', 'Part-time', :department_id
+                                FROM users WHERE user_id = :user_id
+                            ");
+                            $insertFacultyStmt->execute([':department_id' => $departmentId, ':user_id' => $userId]);
+                        }
 
-                    // Refresh the faculty list
-                    $facultyStmt->execute([':department_id' => $departmentId]);
-                    $faculty = $facultyStmt->fetchAll(PDO::FETCH_ASSOC);
+                        $success = "Faculty member added to your department successfully.";
+
+                        $placeholders = implode(',', array_map(fn($id) => ":dept_$id", $departmentIds));
+                        $query = "
+                            SELECT 
+                                u.user_id, 
+                                u.employee_id, 
+                                u.first_name, 
+                                u.last_name, 
+                                f.academic_rank, 
+                                f.employment_type, 
+                                d.department_name, 
+                                c.college_name
+                            FROM 
+                                faculty f 
+                                JOIN users u ON f.user_id = u.user_id 
+                                JOIN departments d ON u.department_id = d.department_id
+                                JOIN colleges c ON u.college_id = c.college_id
+                            WHERE 
+                                u.college_id = :college_id 
+                                AND u.department_id IN ($placeholders)
+                            ORDER BY 
+                                u.last_name, u.first_name
+                        ";
+                        $params = [':college_id' => $collegeId];
+                        foreach ($departmentIds as $id) {
+                            $params[":dept_$id"] = $id;
+                        }
+                        $stmt = $this->db->prepare($query);
+                        $stmt->execute($params);
+                        $faculty = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                    } else {
+                        $error = "Only faculty members can be added to the department.";
+                    }
                 }
             } else {
                 $error = "Cannot add faculty: No department assigned to this chair.";
@@ -991,61 +1377,64 @@ public function faculty()
         }
     }
 
-    // Pass data to the view
-    require_once __DIR__ . '/../views/chair/faculty.php';
-}
-
-/**
- * AJAX endpoint for faculty search suggestions
- */
-public function search()
-{
-    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['name'])) {
+    // Handle removing faculty from the chair's department
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['remove_faculty'])) {
         try {
-            $name = trim($_POST['name']);
-            $collegeId = isset($_POST['college_id']) ? intval($_POST['college_id']) : 0;
-            $departmentId = isset($_POST['department_id']) ? intval($_POST['department_id']) : 0;
-            $chairDepartmentId = $this->getChairDepartment($_SESSION['user_id']);
+            $userId = intval($_POST['user_id']);
+            if ($departmentId) {
+                $checkStmt = $this->db->prepare("SELECT user_id FROM users WHERE user_id = :user_id AND department_id = :department_id");
+                $checkStmt->execute([':user_id' => $userId, ':department_id' => $departmentId]);
 
-            $query = "
-                SELECT u.user_id, u.employee_id, u.first_name, u.last_name
-                FROM faculty f 
-                JOIN users u ON f.user_id = u.user_id 
-                WHERE (u.first_name LIKE :name OR u.last_name LIKE :name)
-            ";
-            $params = [':name' => "%$name%"];
+                if (!$checkStmt->fetchColumn()) {
+                    $error = "This faculty member is not in your department.";
+                } else {
+                    $updateStmt = $this->db->prepare("UPDATE users SET department_id = NULL WHERE user_id = :user_id");
+                    $updateStmt->execute([':user_id' => $userId]);
 
-            if ($collegeId > 0) {
-                $query .= " AND u.college_id = :college_id";
-                $params[':college_id'] = $collegeId;
+                    $updateFacultyStmt = $this->db->prepare("UPDATE faculty SET department_id = NULL WHERE user_id = :user_id");
+                    $updateFacultyStmt->execute([':user_id' => $userId]);
+
+                    $success = "Faculty member removed from your department successfully.";
+
+                    $placeholders = implode(',', array_map(fn($id) => ":dept_$id", $departmentIds));
+                    $query = "
+                        SELECT 
+                            u.user_id, 
+                            u.employee_id, 
+                            u.first_name, 
+                            u.last_name, 
+                            f.academic_rank, 
+                            f.employment_type, 
+                            d.department_name, 
+                            c.college_name
+                        FROM 
+                            faculty f 
+                            JOIN users u ON f.user_id = u.user_id 
+                            JOIN departments d ON u.department_id = d.department_id
+                            JOIN colleges c ON u.college_id = c.college_id
+                        WHERE 
+                            u.college_id = :college_id 
+                            AND u.department_id IN ($placeholders)
+                        ORDER BY 
+                            u.last_name, u.first_name
+                    ";
+                    $params = [':college_id' => $collegeId];
+                    foreach ($departmentIds as $id) {
+                        $params[":dept_$id"] = $id;
+                    }
+                    $stmt = $this->db->prepare($query);
+                    $stmt->execute($params);
+                    $faculty = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                }
+            } else {
+                $error = "Cannot remove faculty: No department assigned to this chair.";
             }
-            if ($departmentId > 0) {
-                $query .= " AND u.department_id = :department_id";
-                $params[':department_id'] = $departmentId;
-            }
-            if ($chairDepartmentId) {
-                $query .= " AND u.department_id != :chair_department_id";
-                $params[':chair_department_id'] = $chairDepartmentId;
-            }
-
-            $query .= " ORDER BY u.last_name, u.first_name LIMIT 10";
-
-            $stmt = $this->db->prepare($query);
-            $stmt->execute($params);
-            $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
-            
-            header('Content-Type: application/json');
-            echo json_encode($results);
-            exit;
         } catch (PDOException $e) {
-            header('Content-Type: application/json');
-            echo json_encode([]);
-            exit;
+            $error = "Failed to remove faculty: " . htmlspecialchars($e->getMessage());
         }
     }
 
-        // Pass data to the view
-        require_once __DIR__ . '/../views/chair/faculty.php';
+    require_once __DIR__ . '/../views/chair/faculty.php';
 }
 
     /**
@@ -1069,7 +1458,8 @@ public function search()
                     'first_name' => trim($_POST['first_name'] ?? ''),
                     'middle_name' => trim($_POST['middle_name'] ?? ''),
                     'last_name' => trim($_POST['last_name'] ?? ''),
-                    'suffix' => trim($_POST['suffix'] ?? '')
+                    'suffix' => trim($_POST['suffix'] ?? ''),
+                    'college_id' => $_SESSION['college_id'] ?? null
                 ];
 
                 $errors = [];
@@ -1081,6 +1471,9 @@ public function search()
                 }
                 if (empty($data['last_name'])) {
                     $errors[] = "Last name is required.";
+                }
+                if (!empty($data['phone']) && !preg_match('/^\d{10,12}$/', $data['phone'])) {
+                    $errors[] = "Phone number must be 10-12 digits.";
                 }
 
                 // Handle file upload
@@ -1126,7 +1519,9 @@ public function search()
                     $stmt = $this->db->prepare($query);
                     $stmt->execute($params);
 
+                    // Update session variables
                     $_SESSION['first_name'] = $data['first_name'];
+                    $_SESSION['email'] = $data['email'];
                     $success = "Profile updated successfully.";
                 } else {
                     error_log("profile: Validation errors - " . implode(", ", $errors));
@@ -1140,34 +1535,47 @@ public function search()
 
         try {
             // Fetch user data
-            $stmt = $this->db->prepare("SELECT u.*, d.department_name 
-                                    FROM users u 
-                                    JOIN program_chairs pc ON u.user_id = pc.user_id 
-                                    JOIN programs p ON pc.program_id = p.program_id 
-                                    JOIN departments d ON p.department_id = d.department_id 
-                                    WHERE u.user_id = :user_id AND pc.is_current = 1");
+            $stmt = $this->db->prepare("
+                SELECT u.*, d.department_name, c.college_name, r.role_name
+                FROM users u
+                LEFT JOIN departments d ON u.department_id = d.department_id
+                LEFT JOIN colleges c ON u.college_id = c.college_id
+                LEFT JOIN roles r ON u.role_id = r.role_id
+                LEFT JOIN program_chairs pc ON u.user_id = pc.user_id
+                WHERE u.user_id = :user_id AND (pc.is_current = 1 OR pc.is_current IS NULL)
+            ");
             $stmt->execute([':user_id' => $_SESSION['user_id']]);
             $user = $stmt->fetch(PDO::FETCH_ASSOC);
 
+            if (!$user) {
+                throw new Exception("User not found");
+            }
+
             // Fetch faculty count for the department
-            $stmt = $this->db->prepare("SELECT COUNT(*) as facultyCount 
-                                    FROM faculty f 
-                                    JOIN department_instructors di ON f.user_id = di.user_id 
-                                    WHERE di.department_id = :department_id AND di.is_current = 1");
+            $stmt = $this->db->prepare("
+                SELECT COUNT(*) as facultyCount 
+                FROM faculty f 
+                JOIN department_instructors di ON f.user_id = di.user_id 
+                WHERE di.department_id = :department_id AND di.is_current = 1
+            ");
             $stmt->execute([':department_id' => $user['department_id']]);
             $facultyCount = $stmt->fetch(PDO::FETCH_ASSOC)['facultyCount'];
 
             // Fetch courses count for the department
-            $stmt = $this->db->prepare("SELECT COUNT(*) as coursesCount 
-                                    FROM courses c 
-                                    WHERE c.department_id = :department_id AND c.is_active = 1");
+            $stmt = $this->db->prepare("
+                SELECT COUNT(*) as coursesCount 
+                FROM courses c 
+                WHERE c.department_id = :department_id AND c.is_active = 1
+            ");
             $stmt->execute([':department_id' => $user['department_id']]);
             $coursesCount = $stmt->fetch(PDO::FETCH_ASSOC)['coursesCount'];
 
             // Fetch pending applicants count from faculty_requests
-            $stmt = $this->db->prepare("SELECT COUNT(*) as pendingApplicantsCount 
-                                    FROM faculty_requests fr 
-                                    WHERE fr.department_id = :department_id AND fr.status = 'pending'");
+            $stmt = $this->db->prepare("
+                SELECT COUNT(*) as pendingApplicantsCount 
+                FROM faculty_requests fr 
+                WHERE fr.department_id = :department_id AND fr.status = 'pending'
+            ");
             $stmt->execute([':department_id' => $user['department_id']]);
             $pendingApplicantsCount = $stmt->fetch(PDO::FETCH_ASSOC)['pendingApplicantsCount'];
 
@@ -1177,15 +1585,150 @@ public function search()
             $currentSemester = $stmt->fetch(PDO::FETCH_ASSOC)['semester_name'] ?? '2nd';
 
             // Fetch last login from auth_logs
-            $stmt = $this->db->prepare("SELECT created_at FROM auth_logs WHERE user_id = :user_id ORDER BY created_at DESC LIMIT 1");
+            $stmt = $this->db->prepare("
+                SELECT created_at FROM auth_logs 
+                WHERE user_id = :user_id AND action = 'login_success' 
+                ORDER BY created_at DESC LIMIT 1
+            ");
             $stmt->execute([':user_id' => $_SESSION['user_id']]);
-            $lastLogin = $stmt->fetch(PDO::FETCH_ASSOC) ? $stmt->fetch(PDO::FETCH_ASSOC)['created_at'] : 'January 1, 1970, 1:00 am';
+            $lastLogin = $stmt->fetch(PDO::FETCH_ASSOC)['created_at'] ?? 'January 1, 1970, 1:00 am';
 
             require_once __DIR__ . '/../views/chair/profile.php';
-        } catch (PDOException $e) {
+        } catch (Exception $e) {
             error_log("profile: Error - " . $e->getMessage());
             $error = "Failed to load profile.";
             require_once __DIR__ . '/../views/chair/profile.php';
         }
     }
+    /**
+ * Search faculty by name or employee ID for the chair's college
+ */
+public function searchFaculty()
+{
+    try {
+        // Ensure the request is a POST
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            error_log("searchFaculty: Invalid request method - expected POST, got " . $_SERVER['REQUEST_METHOD']);
+            http_response_code(405);
+            echo json_encode([]);
+            return;
+        }
+
+        // Get the chair's department and college
+        $chairId = $_SESSION['user_id'] ?? null;
+        if (!$chairId) {
+            error_log("searchFaculty: No user_id in session");
+            http_response_code(400);
+            echo json_encode([]);
+            return;
+        }
+        error_log("searchFaculty: Processing for chairId: $chairId");
+
+        $departmentId = $this->getChairDepartment($chairId);
+        if (!$departmentId) {
+            error_log("searchFaculty: No department found for chairId: $chairId");
+            http_response_code(400);
+            echo json_encode([]);
+            return;
+        }
+        error_log("searchFaculty: Department ID: $departmentId");
+
+        $collegeStmt = $this->db->prepare("SELECT college_id FROM departments WHERE department_id = :department_id");
+        $collegeStmt->execute([':department_id' => $departmentId]);
+        $collegeId = $collegeStmt->fetchColumn();
+
+        if (!$collegeId) {
+            error_log("searchFaculty: No college found for departmentId: $departmentId");
+            http_response_code(400);
+            echo json_encode([]);
+            return;
+        }
+        error_log("searchFaculty: College ID: $collegeId");
+
+        // Get all departments under the chair's college
+        $deptStmt = $this->db->prepare("SELECT department_id FROM departments WHERE college_id = :college_id");
+        $deptStmt->execute([':college_id' => $collegeId]);
+        $departmentIds = $deptStmt->fetchAll(PDO::FETCH_COLUMN);
+
+        if (empty($departmentIds)) {
+            error_log("searchFaculty: No departments found under collegeId: $collegeId");
+            echo json_encode([]);
+            return;
+        }
+        error_log("searchFaculty: Department IDs under college: " . implode(',', $departmentIds));
+
+        // Get the search query for name and employee_id
+        $name = isset($_POST['name']) ? trim($_POST['name']) : '';
+        $employee_id = isset($_POST['employee_id']) ? trim($_POST['employee_id']) : '';
+        error_log("searchFaculty: Search parameters - name: '$name', employee_id: '$employee_id'");
+
+        // Validate input
+        if (empty($name) && empty($employee_id)) {
+            error_log("searchFaculty: No search parameters provided");
+            echo json_encode([]);
+            return;
+        }
+
+        // Build the query to search for faculty
+        $placeholders = implode(',', array_map(fn($id) => ":dept_$id", $departmentIds));
+        $query = "
+            SELECT 
+                u.user_id,
+                u.employee_id,
+                u.first_name,
+                u.last_name,
+                r.role_name,
+                f.academic_rank,
+                f.employment_type,
+                d.department_name,
+                c.college_name,
+                pc.program_id,
+                p.program_name,
+                deans.college_id AS dean_college_id
+            FROM 
+                users u
+                LEFT JOIN roles r ON u.role_id = r.role_id
+                LEFT JOIN faculty f ON u.user_id = f.user_id
+                LEFT JOIN departments d ON u.department_id = d.department_id
+                LEFT JOIN colleges c ON u.college_id = c.college_id
+                LEFT JOIN program_chairs pc ON u.user_id = pc.user_id AND pc.is_current = 1
+                LEFT JOIN programs p ON pc.program_id = p.program_id
+                LEFT JOIN deans ON u.user_id = deans.user_id AND deans.is_current = 1
+            WHERE 
+                u.role_id IN (4, 5, 6)
+                AND u.college_id = :college_id
+                AND u.department_id IN ($placeholders)
+        ";
+        $params = [':college_id' => $collegeId];
+        foreach ($departmentIds as $id) {
+            $params[":dept_$id"] = $id;
+        }
+
+        if (!empty($name)) {
+            $query .= " AND (u.first_name LIKE :name OR u.last_name LIKE :name OR CONCAT(u.first_name, ' ', u.last_name) LIKE :name)";
+            $params[':name'] = "%$name%";
+        }
+        if (!empty($employee_id)) {
+            $query .= " AND u.employee_id LIKE :employee_id";
+            $params[':employee_id'] = "%$employee_id%";
+        }
+
+        $query .= " ORDER BY u.last_name, u.first_name LIMIT 10";
+        error_log("searchFaculty: Executing query: $query");
+        error_log("searchFaculty: Query parameters: " . json_encode($params));
+
+        $stmt = $this->db->prepare($query);
+        $stmt->execute($params);
+        $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        error_log("searchFaculty: Found " . count($results) . " results");
+
+        // Return the results as JSON
+        header('Content-Type: application/json');
+        echo json_encode($results);
+    } catch (PDOException $e) {
+        error_log("searchFaculty: Error - " . $e->getMessage());
+        http_response_code(500);
+        echo json_encode([]);
+    }
+}
 }

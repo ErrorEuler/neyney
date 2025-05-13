@@ -12,6 +12,25 @@ class UserModel
     }
 
     /**
+     * Check if an email already exists
+     * @param string $email
+     * @return bool
+     */
+    public function emailExists($email)
+    {
+        try {
+            $query = "SELECT COUNT(*) FROM users WHERE email = :email";
+            $stmt = $this->db->prepare($query);
+            $stmt->bindParam(':email', $email, PDO::PARAM_STR);
+            $stmt->execute();
+            return $stmt->fetchColumn() > 0;
+        } catch (PDOException $e) {
+            error_log("Error checking email existence: " . $e->getMessage());
+            return false;
+        }
+    }
+
+    /**
      * Fetch user details by user ID
      * @param int $userId
      * @return array
@@ -179,20 +198,21 @@ class UserModel
     {
         try {
             $query = "
-            INSERT INTO faculty (
-                user_id, employee_id, academic_rank, employment_type, department_id, primary_program_id
-            ) VALUES (
-                :user_id, :employee_id, :academic_rank, :employment_type, :department_id, :primary_program_id
-            )
-        ";
+                INSERT INTO faculty (
+                    user_id, employee_id, academic_rank, employment_type, classification, department_id, primary_program_id
+                ) VALUES (
+                    :user_id, :employee_id, :academic_rank, :employment_type, :classification, :department_id, :primary_program_id
+                )
+            ";
             $stmt = $this->db->prepare($query);
             $stmt->execute([
                 ':user_id' => $data['user_id'],
                 ':employee_id' => $data['employee_id'],
                 ':academic_rank' => $data['academic_rank'],
                 ':employment_type' => $data['employment_type'],
+                ':classification' => $data['classification'] ?? null,
                 ':department_id' => $data['department_id'],
-                ':primary_program_id' => $data['primary_program_id']
+                ':primary_program_id' => $data['primary_program_id'] ?? null
             ]);
             return true;
         } catch (PDOException $e) {
@@ -422,6 +442,28 @@ class UserModel
             return $stmt->fetchAll(PDO::FETCH_ASSOC);
         } catch (PDOException $e) {
             error_log("Error fetching departments: " . $e->getMessage());
+            return [];
+        }
+    }
+
+    /**
+     * Get programs by department
+     * @param int $departmentId
+     * @return array
+     */
+    public function getProgramsByDepartment($departmentId)
+    {
+        try {
+            $query = "SELECT program_id, program_name 
+                      FROM programs 
+                      WHERE department_id = :department_id 
+                      ORDER BY program_name";
+            $stmt = $this->db->prepare($query);
+            $stmt->bindParam(':department_id', $departmentId, PDO::PARAM_INT);
+            $stmt->execute();
+            return $stmt->fetchAll(PDO::FETCH_ASSOC);
+        } catch (PDOException $e) {
+            error_log("Error fetching programs by department: " . $e->getMessage());
             return [];
         }
     }

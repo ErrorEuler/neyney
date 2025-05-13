@@ -9,6 +9,33 @@ if (!isset($curricula)) {
 // Ensure $courses is set
 if (!isset($courses)) {
     $courses = [];
+    $coursesStmt = $db->prepare("SELECT course_id, course_code, course_name, units FROM courses WHERE department_id = :department_id");
+    $coursesStmt->execute([':department_id' => $departmentId]);
+    $courses = $coursesStmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+// Handle AJAX request for course code validation
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'check_course_code') {
+    header('Content-Type: application/json');
+    $course_code = trim($_POST['course_code'] ?? '');
+    $response = ['exists' => false, 'message' => ''];
+
+    if (!empty($course_code)) {
+        try {
+            $stmt = $db->prepare("SELECT COUNT(*) FROM courses WHERE course_code = :code AND department_id = :dept");
+            $stmt->execute([':code' => $course_code, ':dept' => $departmentId]);
+            $count = $stmt->fetchColumn();
+            if ($count > 0) {
+                $response['exists'] = true;
+                $response['message'] = 'This course code already exists.';
+            }
+        } catch (PDOException $e) {
+            $response['message'] = 'Error checking course code: ' . htmlspecialchars($e->getMessage());
+        }
+    }
+
+    echo json_encode($response);
+    exit;
 }
 
 // Handle form submissions
@@ -20,6 +47,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $curriculum_name = trim($_POST['curriculum_name'] ?? '');
                 $curriculum_code = trim($_POST['curriculum_code'] ?? '');
                 $effective_year = intval($_POST['effective_year'] ?? 0);
+                $description = trim($_POST['description'] ?? '');
                 $total_units = 0; // Will be updated when courses are added
 
                 $errors = [];
@@ -28,7 +56,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($effective_year < 2000 || $effective_year > 2100) $errors[] = "Invalid effective year.";
 
                 if (empty($errors)) {
+                    $stmt = $db->prepare("INSERT INTO curricula (curriculum_name, curriculum_code, description, total_units, department_id, effective_year, status) VALUES (:name, :code, :desc, :units, :dept, :year, 'Draft')");
+                    $stmt->execute([
+                        ':name' => $curriculum_name,
+                        ':code' => $curriculum_code,
+                        ':desc' => $description,
+                        ':units' => $total_units,
+                        ':dept' => $departmentId,
+                        ':year' => $effective_year
+                    ]);
+                    $curriculum_id = $db->lastInsertId();
+
+                    // Associate with the program (assuming one program per department for simplicity)
+                    $programStmt = $db->prepare("SELECT program_id FROM programs WHERE department_id = :department_id LIMIT 1");
+                    $programStmt->execute([':department_id' => $departmentId]);
+                    $program_id = $programStmt->fetchColumn();
+                    if ($program_id) {
+                        $db->prepare("INSERT INTO curriculum_programs (curriculum_id, program_id, is_primary, required) VALUES (:curriculum_id, :program_id, 1, 1)")
+                            ->execute([':curriculum_id' => $curriculum_id, ':program_id' => $program_id]);
+                    }
+
                     $success = "Curriculum added successfully.";
+                    // Refresh the curricula list
+                    $curriculaStmt = $db->prepare("SELECT c.*, p.program_name 
+                                                  FROM curricula c 
+                                                  JOIN programs p ON c.department_id = p.department_id 
+                                                  WHERE c.department_id = :department_id");
+                    $curriculaStmt->execute([':department_id' => $departmentId]);
+                    $curricula = $curriculaStmt->fetchAll(PDO::FETCH_ASSOC);
                 } else {
                     $error = implode("<br>", $errors);
                 }
@@ -38,6 +93,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $curriculum_name = trim($_POST['curriculum_name'] ?? '');
                 $curriculum_code = trim($_POST['curriculum_code'] ?? '');
                 $effective_year = intval($_POST['effective_year'] ?? 0);
+                $description = trim($_POST['description'] ?? '');
                 $status = $_POST['status'] ?? 'Draft';
 
                 $errors = [];
@@ -48,7 +104,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (!in_array($status, ['Draft', 'Active', 'Archived'])) $errors[] = "Invalid status.";
 
                 if (empty($errors)) {
+                    $stmt = $db->prepare("UPDATE curricula SET curriculum_name = :name, curriculum_code = :code, description = :desc, effective_year = :year, status = :status WHERE curriculum_id = :id");
+                    $stmt->execute([
+                        ':name' => $curriculum_name,
+                        ':code' => $curriculum_code,
+                        ':desc' => $description,
+                        ':year' => $effective_year,
+                        ':status' => $status,
+                        ':id' => $curriculum_id
+                    ]);
+
                     $success = "Curriculum updated successfully.";
+                    // Refresh the curricula list
+                    $curriculaStmt = $db->prepare("SELECT c.*, p.program_name 
+                                                  FROM curricula c 
+                                                  JOIN programs p ON c.department_id = p.department_id 
+                                                  WHERE c.department_id = :department_id");
+                    $curriculaStmt->execute([':department_id' => $departmentId]);
+                    $curricula = $curriculaStmt->fetchAll(PDO::FETCH_ASSOC);
                 } else {
                     $error = implode("<br>", $errors);
                 }
@@ -68,7 +141,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (!in_array($subject_type, ['Major', 'Minor', 'General Education', 'Elective'])) $errors[] = "Invalid subject type.";
 
                 if (empty($errors)) {
+                    // Insert into curriculum_courses
+                    $stmt = $db->prepare("INSERT INTO curriculum_courses (curriculum_id, course_id, year_level, semester, subject_type, is_core) VALUES (:curriculum_id, :course_id, :year_level, :semester, :subject_type, 1)");
+                    $stmt->execute([
+                        ':curriculum_id' => $curriculum_id,
+                        ':course_id' => $course_id,
+                        ':year_level' => $year_level,
+                        ':semester' => $semester,
+                        ':subject_type' => $subject_type
+                    ]);
+
+                    // Update total_units in curricula
+                    $unitsStmt = $db->prepare("SELECT SUM(c.units) as total FROM curriculum_courses cc JOIN courses c ON cc.course_id = c.course_id WHERE cc.curriculum_id = :curriculum_id");
+                    $unitsStmt->execute([':curriculum_id' => $curriculum_id]);
+                    $total_units = $unitsStmt->fetchColumn();
+
+                    $db->prepare("UPDATE curricula SET total_units = :total_units WHERE curriculum_id = :curriculum_id")
+                        ->execute([':total_units' => $total_units, ':curriculum_id' => $curriculum_id]);
+
                     $success = "Course added to curriculum successfully.";
+                    // Refresh the curricula list
+                    $curriculaStmt = $db->prepare("SELECT c.*, p.program_name 
+                                                  FROM curricula c 
+                                                  JOIN programs p ON c.department_id = p.department_id 
+                                                  WHERE c.department_id = :department_id");
+                    $curriculaStmt->execute([':department_id' => $departmentId]);
+                    $curricula = $curriculaStmt->fetchAll(PDO::FETCH_ASSOC);
                 } else {
                     $error = implode("<br>", $errors);
                 }
@@ -77,14 +175,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $course_code = trim($_POST['course_code'] ?? '');
                 $course_name = trim($_POST['course_name'] ?? '');
                 $units = intval($_POST['units'] ?? 0);
+                $description = trim($_POST['description'] ?? '');
 
                 $errors = [];
                 if (empty($course_code)) $errors[] = "Course code is required.";
                 if (empty($course_name)) $errors[] = "Course name is required.";
                 if ($units < 1 || $units > 10) $errors[] = "Units must be between 1 and 10.";
+                // Check if course code already exists
+                $stmt = $db->prepare("SELECT COUNT(*) FROM courses WHERE course_code = :code AND department_id = :dept");
+                $stmt->execute([':code' => $course_code, ':dept' => $departmentId]);
+                if ($stmt->fetchColumn() > 0) {
+                    $errors[] = "Course code already exists.";
+                }
 
                 if (empty($errors)) {
+                    $stmt = $db->prepare("INSERT INTO courses (course_code, course_name, units, department_id) VALUES (:code, :name, :units, :dept)");
+                    $stmt->execute([
+                        ':code' => $course_code,
+                        ':name' => $course_name,
+                        ':units' => $units,
+                        ':dept' => $departmentId
+                    ]);
+
                     $success = "Course created successfully.";
+                    // Refresh the courses list
+                    $coursesStmt = $db->prepare("SELECT course_id, course_code, course_name, units FROM courses WHERE department_id = :department_id");
+                    $coursesStmt->execute([':department_id' => $departmentId]);
+                    $courses = $coursesStmt->fetchAll(PDO::FETCH_ASSOC);
                 } else {
                     $error = implode("<br>", $errors);
                 }
@@ -93,10 +210,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $curriculum_id = intval($_POST['curriculum_id'] ?? 0);
                 $new_status = $_POST['status'] === 'Active' ? 'Draft' : 'Active';
 
+                $stmt = $db->prepare("UPDATE curricula SET status = :status WHERE curriculum_id = :curriculum_id");
+                $stmt->execute([':status' => $new_status, ':curriculum_id' => $curriculum_id]);
+
                 $success = "Curriculum status updated to $new_status.";
+                // Refresh the curricula list
+                $curriculaStmt = $db->prepare("SELECT c.*, p.program_name 
+                                              FROM curricula c 
+                                              JOIN programs p ON c.department_id = p.department_id 
+                                              WHERE c.department_id = :department_id");
+                $curriculaStmt->execute([':department_id' => $departmentId]);
+                $curricula = $curriculaStmt->fetchAll(PDO::FETCH_ASSOC);
             }
-        } catch (Exception $e) {
-            $error = "Error: " . htmlspecialchars($e->getMessage());
+        } catch (PDOException $e) {
+            $error = "Database error: " . htmlspecialchars($e->getMessage());
         }
     }
 }
@@ -202,7 +329,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     .modal-overlay {
-        background-color: var(--prmsu-white);
+        background-color: rgba(0, 0, 0, 0.5);
         backdrop-filter: blur(4px);
         transition: opacity 0.3s ease, transform 0.3s ease;
         transform: scale(0.95);
@@ -280,58 +407,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         display: block;
     }
 
-    .input-container {
-        position: relative;
-    }
-
-    .input-container.invalid input,
-    .input-container.invalid select,
-    .input-container.invalid textarea {
-        border-color: #dc2626;
-    }
-
-    .input-container.valid input,
-    .input-container.valid select,
-    .input-container.valid textarea {
-        border-color: #16a34a;
-    }
-
-    .validation-feedback {
+    .error-text {
+        color: #B91C1C;
+        font-size: 0.875rem;
+        margin-top: 0.25rem;
         display: none;
-        position: absolute;
-        top: 100%;
-        left: 0;
-        background-color: #fff;
-        border: 1px solid #ccc;
-        padding: 5px 10px;
-        border-radius: 4px;
-        font-size: 12px;
-        color: #dc2626;
-        z-index: 10;
-    }
-
-    .input-container.invalid .validation-feedback {
-        display: block;
-        color: #dc2626;
-    }
-
-    .input-container.valid .validation-feedback {
-        display: block;
-        color: #16a34a;
-    }
-
-    .preview-box {
-        margin-top: 10px;
-        padding: 10px;
-        border: 1px dashed var(--prmsu-gray);
-        border-radius: 8px;
-        background-color: var(--prmsu-gray-light);
-        font-size: 14px;
-    }
-
-    .disabled-btn {
-        opacity: 0.6;
-        cursor: not-allowed;
     }
 </style>
 
@@ -416,23 +496,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <tbody class="divide-y divide-prmsu-gray-light">
                     <?php foreach ($curricula as $curriculum): ?>
                         <?php
-                        $course_count = 0; // Placeholder since no DB
-                        $curriculum_courses = []; // Placeholder since no DB
+                        // Fetch the number of courses in this curriculum
+                        $courseCountStmt = $db->prepare("SELECT COUNT(*) FROM curriculum_courses WHERE curriculum_id = :curriculum_id");
+                        $courseCountStmt->execute([':curriculum_id' => $curriculum['curriculum_id']]);
+                        $course_count = $courseCountStmt->fetchColumn();
+
+                        // Fetch courses for the curriculum to display in the View Courses modal
+                        $coursesStmt = $db->prepare("SELECT c.course_code, c.course_name, c.units, cc.year_level, cc.semester, cc.subject_type 
+                                                    FROM curriculum_courses cc 
+                                                    JOIN courses c ON cc.course_id = c.course_id 
+                                                    WHERE cc.curriculum_id = :curriculum_id");
+                        $coursesStmt->execute([':curriculum_id' => $curriculum['curriculum_id']]);
+                        $curriculum_courses = $coursesStmt->fetchAll(PDO::FETCH_ASSOC);
                         ?>
                         <tr class="table-row">
-                            <td class="px-4 sm:px-6 py-4 text-sm font-medium text-prmsu-gray-dark"><?= htmlspecialchars($curriculum['curriculum_name'] ?? 'N/A') ?></td>
+                            <td class="px-4 sm:px-6 py-4 text-sm font-medium text-prmsu-gray-dark"><?= htmlspecialchars($curriculum['curriculum_name']) ?></td>
                             <td class="px-4 sm:px-6 py-4 text-sm text-prmsu-gray"><?= htmlspecialchars($course_count) ?> Courses</td>
-                            <td class="px-4 sm:px-6 py-4 text-sm text-prmsu-gray"><?= htmlspecialchars($curriculum['total_units'] ?? '0') ?> Total Units</td>
-                            <td class="px-4 sm:px-6 py-4 text-sm text-prmsu-gray"><?= htmlspecialchars($curriculum['updated_at'] ?? 'N/A') ?></td>
+                            <td class="px-4 sm:px-6 py-4 text-sm text-prmsu-gray"><?= htmlspecialchars($curriculum['total_units']) ?> Total Units</td>
+                            <td class="px-4 sm:px-6 py-4 text-sm text-prmsu-gray"><?= htmlspecialchars($curriculum['updated_at']) ?></td>
                             <td class="px-4 sm:px-6 py-4 text-sm">
-                                <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium <?= ($curriculum['status'] ?? 'Draft') === 'Active' ? 'bg-[var(--solid-green)] text-green-700' : 'bg-prmsu-gray-light text-prmsu-gray' ?>">
-                                    <span class="w-2 h-2 mr-2 rounded-full <?= ($curriculum['status'] ?? 'Draft') === 'Active' ? 'bg-green-500' : 'bg-prmsu-gray' ?>"></span>
-                                    <?= htmlspecialchars($curriculum['status'] ?? 'Draft') ?>
+                                <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium <?= $curriculum['status'] === 'Active' ? 'bg-[var(--solid-green)] text-green-700' : 'bg-prmsu-gray-light text-prmsu-gray' ?>">
+                                    <span class="w-2 h-2 mr-2 rounded-full <?= $curriculum['status'] === 'Active' ? 'bg-green-500' : 'bg-prmsu-gray' ?>"></span>
+                                    <?= htmlspecialchars($curriculum['status']) ?>
                                 </span>
                             </td>
                             <td class="px-4 sm:px-6 py-4 text-sm font-medium">
                                 <div class="flex space-x-3">
-                                    <button onclick='openViewCoursesModal(<?= json_encode($curriculum_courses) ?>, "<?= htmlspecialchars($curriculum['curriculum_name'] ?? 'N/A') ?>")'
+                                    <button onclick='openViewCoursesModal(<?= json_encode($curriculum_courses) ?>, "<?= htmlspecialchars($curriculum['curriculum_name']) ?>")'
                                         class="text-blue-600 hover:text-blue-800 transition-all"
                                         title="View Courses">
                                         <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -440,7 +530,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
                                         </svg>
                                     </button>
-                                    <button onclick="openManageCoursesModal(<?= $curriculum['curriculum_id'] ?? 0 ?>, '<?= htmlspecialchars($curriculum['curriculum_name'] ?? 'N/A') ?>')"
+                                    <button onclick="openManageCoursesModal(<?= $curriculum['curriculum_id'] ?>, '<?= htmlspecialchars($curriculum['curriculum_name']) ?>')"
                                         class="text-green-600 hover:text-green-800 transition-all"
                                         title="Manage Courses">
                                         <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -448,11 +538,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                         </svg>
                                     </button>
                                     <button onclick='openEditCurriculumModal(<?= json_encode([
-                                                                                    "id" => $curriculum['curriculum_id'] ?? 0,
-                                                                                    "name" => htmlspecialchars($curriculum['curriculum_name'] ?? 'N/A'),
-                                                                                    "code" => htmlspecialchars($curriculum['curriculum_code'] ?? 'N/A'),
-                                                                                    "year" => $curriculum['effective_year'] ?? 2025,
-                                                                                    "status" => $curriculum['status'] ?? 'Draft'
+                                                                                    "id" => $curriculum['curriculum_id'],
+                                                                                    "name" => htmlspecialchars($curriculum['curriculum_name']),
+                                                                                    "code" => htmlspecialchars($curriculum['curriculum_code']),
+                                                                                    "year" => $curriculum['effective_year'],
+                                                                                    "description" => htmlspecialchars($curriculum['description']),
+                                                                                    "status" => $curriculum['status']
                                                                                 ]) ?>)'
                                         class="text-blue-600 hover:text-blue-800 transition-all"
                                         title="Edit Curriculum">
@@ -462,13 +553,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                     </button>
                                     <form method="POST" class="inline">
                                         <input type="hidden" name="action" value="toggle_curriculum">
-                                        <input type="hidden" name="curriculum_id" value="<?= $curriculum['curriculum_id'] ?? 0 ?>">
-                                        <input type="hidden" name="status" value="<?= $curriculum['status'] ?? 'Draft' ?>">
+                                        <input type="hidden" name="curriculum_id" value="<?= $curriculum['curriculum_id'] ?>">
+                                        <input type="hidden" name="status" value="<?= $curriculum['status'] ?>">
                                         <button type="submit"
                                             class="text-prmsu-gray hover:text-prmsu-gray-dark transition-all"
-                                            title="<?= ($curriculum['status'] ?? 'Draft') === 'Active' ? 'Deactivate Curriculum' : 'Activate Curriculum' ?>">
+                                            title="<?= $curriculum['status'] === 'Active' ? 'Deactivate Curriculum' : 'Activate Curriculum' ?>">
                                             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="<?= ($curriculum['status'] ?? 'Draft') === 'Active' ? 'M10 9v6m4-6v6m-7-3h10' : 'M9 12h6m-3-3v6' ?>" />
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="<?= $curriculum['status'] === 'Active' ? 'M10 9v6m4-6v6m-7-3h10' : 'M9 12h6m-3-3v6' ?>" />
                                             </svg>
                                         </button>
                                     </form>
@@ -534,54 +625,52 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 <!-- Curriculum Form -->
                 <div id="curriculumForm" class="tab-content">
-                    <form method="POST" class="space-y-5" id="curriculumFormSubmit">
+                    <form method="POST" class="space-y-5">
                         <input type="hidden" name="action" value="add_curriculum">
-                        <div class="input-container" id="curriculumNameContainer">
+                        <div class="form-group">
                             <label class="block text-sm font-medium text-gray-700 mb-1">Curriculum Name</label>
-                            <input type="text" name="curriculum_name" placeholder="e.g. Bachelor of Science in Information Technology"
-                                class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-amber-500 transition-colors"
-                                required oninput="validateField('curriculum_name', this.value)">
-                            <div class="validation-feedback" id="curriculumNameFeedback"></div>
+                            <input type="text" name="curriculum_name" placeholder="e.g. Bachelor of Science in Computer Science"
+                                class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-amber-500 transition-colors" required>
                         </div>
                         <div class="grid grid-cols-2 gap-4">
-                            <div class="input-container" id="curriculumCodeContainer">
+                            <div class="form-group">
                                 <label class="block text-sm font-medium text-gray-700 mb-1">Curriculum Code</label>
-                                <input type="text" name="curriculum_code" placeholder="e.g. BSIT-2025"
-                                    class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-amber-500 transition-colors"
-                                    required oninput="validateField('curriculum_code', this.value, 'curriculumNameContainer')">
-                                <div class="validation-feedback" id="curriculumCodeFeedback"></div>
+                                <input type="text" name="curriculum_code" placeholder="e.g. BSCS-2025"
+                                    class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-amber-500 transition-colors" required>
                             </div>
-                            <div class="input-container" id="effectiveYearContainer">
+                            <div class="form-group">
                                 <label class="block text-sm font-medium text-gray-700 mb-1">Effective Year</label>
                                 <input type="number" name="effective_year" value="2025" min="2000" max="2100"
-                                    class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-amber-500 transition-colors"
-                                    required oninput="validateField('effective_year', this.value)">
-                                <div class="validation-feedback" id="effectiveYearFeedback"></div>
+                                    class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-amber-500 transition-colors" required>
                             </div>
                         </div>
-                        <div class="preview-box" id="curriculumPreview">
-                            Preview will appear here as you fill the form...
+                        <div class="form-group">
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Description</label>
+                            <textarea name="description" rows="3" placeholder="Brief description of the curriculum..."
+                                class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-amber-500 transition-colors resize-none"></textarea>
                         </div>
                         <div class="mt-6 pt-4 border-t border-gray-200 flex justify-end space-x-3">
                             <button type="button" onclick="closeModal('addCurriculumCourseModal')"
                                 class="px-5 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-500">
                                 Cancel
                             </button>
-                            <button type="submit" id="submitCurriculumBtn"
-                                class="px-5 py-2 bg-amber-500 text-white rounded-lg hover:bg-amber-600 transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-amber-500 disabled-btn"
-                                disabled>Create Curriculum</button>
+                            <button type="submit"
+                                class="px-5 py-2 bg-amber-500 text-white rounded-lg hover:bg-amber-600 transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-amber-500">
+                                Create Curriculum
+                            </button>
                         </div>
                     </form>
                 </div>
 
                 <!-- Course Form -->
                 <div id="courseForm" class="tab-content hidden">
-                    <form method="POST" class="space-y-5">
+                    <form method="POST" class="space-y-5" id="courseFormElement">
                         <input type="hidden" name="action" value="create_course">
                         <div class="form-group">
                             <label class="block text-sm font-medium text-gray-700 mb-1">Course Code</label>
-                            <input type="text" name="course_code" placeholder="e.g. CS101"
+                            <input type="text" name="course_code" id="courseCodeInput" placeholder="e.g. CS101"
                                 class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-amber-500 transition-colors" required>
+                            <p id="courseCodeError" class="error-text"></p>
                         </div>
                         <div class="form-group">
                             <label class="block text-sm font-medium text-gray-700 mb-1">Course Name</label>
@@ -598,7 +687,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                 class="px-5 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-500">
                                 Cancel
                             </button>
-                            <button type="submit"
+                            <button type="submit" id="createCourseButton"
                                 class="px-5 py-2 bg-amber-500 text-white rounded-lg hover:bg-amber-600 transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-amber-500">
                                 Create Course
                             </button>
@@ -649,6 +738,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         </div>
                     </div>
                     <div>
+                        <label class="block text-sm font-medium text-prmsu-gray-dark mb-1">Description</label>
+                        <textarea name="description" id="editDescription" rows="3"
+                            class="focus-gold" placeholder="Provide a brief description of this curriculum..."></textarea>
+                    </div>
+                    <div>
                         <label class="block text-sm font-medium text-prmsu-gray-dark mb-1">Status</label>
                         <select name="status" id="editStatus" class="focus-gold">
                             <option value="Draft">Draft</option>
@@ -693,7 +787,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         <select name="course_id" class="focus-gold" required>
                             <option value="">-- Select Course --</option>
                             <?php foreach ($courses as $course): ?>
-                                <option value="<?= $course['course_id'] ?? 0 ?>"><?= htmlspecialchars($course['course_code'] . ' - ' . $course['course_name'] ?? 'N/A') ?></option>
+                                <option value="<?= $course['course_id'] ?>"><?= htmlspecialchars($course['course_code'] . ' - ' . $course['course_name']) ?></option>
                             <?php endforeach; ?>
                         </select>
                     </div>
@@ -775,7 +869,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
                     </svg>
                     <p class="text-lg font-medium mb-2">No courses found</p>
-                    <p class="text-sm">Add courses to this curriculum using the 'Manage Courses' option.</p>
+                    <p class="text-sm">Add courses to this curriculum using the "Manage Courses" option.</p>
                 </div>
             </div>
             <div class="p-6 border-t border-prmsu-gray-light flex justify-end">
@@ -793,19 +887,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         modal.classList.remove('hidden');
 
+        // Get overlay and content elements
         const overlay = modal.querySelector('.modal-overlay');
         const content = modal.querySelector('.modal-content');
 
+        // Force reflow to enable animations
         void modal.offsetWidth;
 
+        // Apply animations
         overlay.classList.add('opacity-100');
         content.classList.remove('translate-y-8');
         content.classList.add('translate-y-0');
 
+        // Initialize the first tab when opening the modal
         if (modalId === 'addCurriculumCourseModal') {
             showTab('curriculumForm', 'curriculumTab');
-            document.getElementById('curriculumFormSubmit').reset();
-            validateAllFields(); // Reset validation on modal open
         }
     }
 
@@ -817,10 +913,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         const overlay = modal.querySelector('.modal-overlay');
         const content = modal.querySelector('.modal-content');
 
+        // Reverse animations
         overlay.classList.remove('opacity-100');
         content.classList.remove('translate-y-0');
         content.classList.add('translate-y-8');
 
+        // Hide modal after animation completes
         setTimeout(() => {
             modal.classList.add('hidden');
         }, 300);
@@ -830,33 +928,45 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     function showTab(tabContentId, tabButtonId) {
         console.log('Switching to tab:', tabContentId);
 
+        // Hide all tab contents
         document.querySelectorAll('.tab-content').forEach(content => {
             content.classList.remove('active');
             content.classList.add('hidden');
         });
 
+        // Show selected tab content
         const selectedTab = document.getElementById(tabContentId);
         if (selectedTab) {
             selectedTab.classList.add('active');
             selectedTab.classList.remove('hidden');
         }
 
+        // Update tab buttons
         document.querySelectorAll('.tab-button').forEach(button => {
             button.classList.remove('active', 'border-amber-500', 'text-amber-600');
             button.classList.add('border-transparent', 'text-gray-500');
         });
 
+        // Highlight selected tab button
         const selectedButton = document.getElementById(tabButtonId);
         if (selectedButton) {
             selectedButton.classList.add('active', 'border-amber-500', 'text-amber-600');
             selectedButton.classList.remove('border-transparent', 'text-gray-500');
         }
 
+        // Update modal title based on active tab
         const modalTitle = document.getElementById('modalTitle');
         if (modalTitle) {
             modalTitle.textContent = tabContentId === 'curriculumForm' ?
                 'Add New Curriculum' :
                 'Add New Course';
+        }
+
+        // Reset course code error when switching tabs
+        if (tabContentId === 'courseForm') {
+            document.getElementById('courseCodeError').style.display = 'none';
+            document.getElementById('courseCodeError').textContent = '';
+            document.getElementById('createCourseButton').disabled = false;
         }
     }
 
@@ -865,6 +975,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         document.getElementById('editCurriculumName').value = curriculum.name;
         document.getElementById('editCurriculumCode').value = curriculum.code;
         document.getElementById('editEffectiveYear').value = curriculum.year;
+        document.getElementById('editDescription').value = curriculum.description;
         document.getElementById('editStatus').value = curriculum.status;
         openModal('editCurriculumModal');
     }
@@ -905,108 +1016,58 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         openModal('viewCoursesModal');
     }
 
-    // Real-time validation and preview
-    function validateField(fieldName, value, dependsOn = null) {
-        const containers = {
-            curriculum_name: document.getElementById('curriculumNameContainer'),
-            curriculum_code: document.getElementById('curriculumCodeContainer'),
-            effective_year: document.getElementById('effectiveYearContainer')
-        };
-        const feedbacks = {
-            curriculum_name: document.getElementById('curriculumNameFeedback'),
-            curriculum_code: document.getElementById('curriculumCodeFeedback'),
-            effective_year: document.getElementById('effectiveYearFeedback')
-        };
-        const submitBtn = document.getElementById('submitCurriculumBtn');
-        let isValid = true;
-
-        switch (fieldName) {
-            case 'curriculum_name':
-                if (value.trim().length < 3) {
-                    containers[fieldName].classList.add('invalid');
-                    containers[fieldName].classList.remove('valid');
-                    feedbacks[fieldName].textContent = 'Name must be at least 3 characters.';
-                    isValid = false;
-                } else {
-                    containers[fieldName].classList.remove('invalid');
-                    containers[fieldName].classList.add('valid');
-                    feedbacks[fieldName].textContent = 'Valid name.';
-                }
-                break;
-            case 'curriculum_code':
-                const nameValue = dependsOn ? document.querySelector(`#${dependsOn} input`).value : '';
-                const initials = nameValue ? nameValue.match(/[A-Z]+/)?.[0].substring(0, 4) || '' : '';
-                if (value.trim().length < 4 || !/[A-Z]{2,}-\d{4}/.test(value)) {
-                    containers[fieldName].classList.add('invalid');
-                    containers[fieldName].classList.remove('valid');
-                    feedbacks[fieldName].textContent = 'Use format like AB-2025.';
-                    isValid = false;
-                } else if (nameValue && !value.toUpperCase().startsWith(initials)) {
-                    containers[fieldName].classList.add('invalid');
-                    containers[fieldName].classList.remove('valid');
-                    feedbacks[fieldName].textContent = `Code should start with curriculum initials (e.g., ${initials || 'AB'}).`;
-                    isValid = false;
-                } else {
-                    containers[fieldName].classList.remove('invalid');
-                    containers[fieldName].classList.add('valid');
-                    feedbacks[fieldName].textContent = 'Valid code.';
-                }
-                break;
-            case 'effective_year':
-                const year = parseInt(value);
-                if (year < 2000 || year > 2100 || isNaN(year)) {
-                    containers[fieldName].classList.add('invalid');
-                    containers[fieldName].classList.remove('valid');
-                    feedbacks[fieldName].textContent = 'Year must be between 2000 and 2100.';
-                    isValid = false;
-                } else {
-                    containers[fieldName].classList.remove('invalid');
-                    containers[fieldName].classList.add('valid');
-                    feedbacks[fieldName].textContent = 'Valid year.';
-                }
-                break;
-        }
-
-        validateAllFields();
-        updatePreview();
-    }
-
-    function validateAllFields() {
-        const containers = [
-            document.getElementById('curriculumNameContainer'),
-            document.getElementById('curriculumCodeContainer'),
-            document.getElementById('effectiveYearContainer')
-        ];
-        const submitBtn = document.getElementById('submitCurriculumBtn');
-        const allValid = containers.every(container => container.classList.contains('valid'));
-
-        if (allValid) {
-            submitBtn.disabled = false;
-            submitBtn.classList.remove('disabled-btn');
-        } else {
-            submitBtn.disabled = true;
-            submitBtn.classList.add('disabled-btn');
-        }
-    }
-
-    function updatePreview() {
-        const name = document.querySelector('input[name="curriculum_name"]').value || 'N/A';
-        const code = document.querySelector('input[name="curriculum_code"]').value || 'N/A';
-        const year = document.querySelector('input[name="effective_year"]').value || 'N/A';
-
-        const preview = document.getElementById('curriculumPreview');
-        preview.innerHTML = `
-            <strong>Preview:</strong><br>
-            Name: ${name}<br>
-            Code: ${code}<br>
-            Year: ${year}
-        `;
-    }
-
-    // Initialize on DOM load
+    // Real-time course code validation
     document.addEventListener('DOMContentLoaded', function() {
+        const courseCodeInput = document.getElementById('courseCodeInput');
+        const courseCodeError = document.getElementById('courseCodeError');
+        const createCourseButton = document.getElementById('createCourseButton');
+        let debounceTimeout;
+
+        if (courseCodeInput) {
+            courseCodeInput.addEventListener('input', function() {
+                clearTimeout(debounceTimeout);
+                debounceTimeout = setTimeout(() => {
+                    const courseCode = courseCodeInput.value.trim();
+                    if (courseCode === '') {
+                        courseCodeError.textContent = '';
+                        courseCodeError.style.display = 'none';
+                        createCourseButton.disabled = false;
+                        return;
+                    }
+
+                    fetch(window.location.href, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/x-www-form-urlencoded',
+                            },
+                            body: `action=check_course_code&course_code=${encodeURIComponent(courseCode)}`
+                        })
+                        .then(response => response.json())
+                        .then(data => {
+                            if (data.exists) {
+                                courseCodeError.textContent = data.message;
+                                courseCodeError.style.display = 'block';
+                                createCourseButton.disabled = true;
+                            } else {
+                                courseCodeError.textContent = '';
+                                courseCodeError.style.display = 'none';
+                                createCourseButton.disabled = false;
+                            }
+                        })
+                        .catch(error => {
+                            courseCodeError.textContent = 'Error checking course code.';
+                            courseCodeError.style.display = 'block';
+                            createCourseButton.disabled = true;
+                            console.error('Error:', error);
+                        });
+                }, 500); // Debounce delay
+            });
+        }
+
+        // Set initial tab when the page loads
         showTab('curriculumForm', 'curriculumTab');
 
+        // Close modal when clicking outside content
         document.querySelectorAll('.modal-overlay').forEach(overlay => {
             overlay.addEventListener('click', function(e) {
                 if (e.target === this) {
@@ -1017,10 +1078,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
             });
         });
-
-        // Initial validation and preview update
-        validateAllFields();
-        updatePreview();
     });
 </script>
 
